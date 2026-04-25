@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+sqlalchemy
+psycopg2-binary
+pyarrow
+matplotlib
+streamlit
+tqdm
