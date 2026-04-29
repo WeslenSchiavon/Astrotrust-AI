@@ -1105,6 +1105,52 @@ def normalize_uploaded_lightcurve(df: pd.DataFrame, inferred: dict):
         out["flux_err"] = pd.to_numeric(out["flux_err"], errors="coerce")
         out.loc[out["flux_err"] <= 0, "flux_err"] = np.nan
 
+    # Preserve useful numeric context columns from real survey tables, e.g. IRSA/ZTF.
+    # These can later become features such as ra_mean, dec_mean, catflags_mean, etc.
+    used_columns = {
+        inferred.get("object_id"),
+        inferred.get("mjd"),
+        inferred.get("band"),
+        inferred.get("flux"),
+        inferred.get("flux_err"),
+        inferred.get("mag"),
+        inferred.get("mag_err"),
+    }
+    used_columns = {c for c in used_columns if c is not None}
+
+    for col in df.columns:
+        if col in used_columns:
+            continue
+
+        col_lower = str(col).lower()
+
+        # Keep common positional/context/quality columns.
+        keep = (
+            col_lower in [
+                "ra",
+                "dec",
+                "catflags",
+                "clrcoeff",
+                "field",
+                "ccdid",
+                "qid",
+                "airmass",
+                "seeing",
+                "fwhm",
+                "chi",
+                "sharp",
+            ]
+            or "ra" == col_lower
+            or "dec" == col_lower
+            or "flag" in col_lower
+            or "quality" in col_lower
+        )
+
+        if keep:
+            numeric_col = pd.to_numeric(df[col], errors="coerce")
+            if numeric_col.notna().any():
+                out[col_lower] = numeric_col
+
     before = len(out)
     out = out.dropna(subset=["mjd", "flux"]).reset_index(drop=True)
     dropped = before - len(out)
@@ -1193,6 +1239,7 @@ def compute_prediction_reliability(
     lc_obj: pd.DataFrame,
     auto_feature_report=None,
     source_domain="generic",
+    prediction_result=None,
 ):
     """Compute a user-facing reliability flag for the current prediction."""
     n_obs = len(lc_obj)
@@ -1246,6 +1293,26 @@ def compute_prediction_reliability(
                     f"Some tabular/context features were auto-filled with zero ({n_missing}/{n_expected})."
                 )
 
+    if prediction_result is not None:
+        novelty_score = prediction_result.get("novelty_score", None)
+        confidence = prediction_result.get("confidence", None)
+
+        if novelty_score is not None and novelty_score >= 0.90:
+            score = 1
+            reasons.append(
+                f"Extreme novelty score ({novelty_score:.3f}); the object is highly out-of-distribution."
+            )
+
+        if (
+            confidence is not None
+            and confidence >= 0.99
+            and novelty_score is not None
+            and novelty_score >= 0.90
+        ):
+            reasons.append(
+                "High confidence combined with extreme novelty can indicate overconfident out-of-domain prediction."
+            )
+
     if score >= 3:
         level = "Good"
     elif score == 2:
@@ -1269,11 +1336,13 @@ def display_prediction_reliability(
     lc_obj: pd.DataFrame,
     auto_feature_report=None,
     source_domain="generic",
+    prediction_result=None,
 ):
     reliability = compute_prediction_reliability(
         lc_obj=lc_obj,
         auto_feature_report=auto_feature_report,
         source_domain=source_domain,
+        prediction_result=prediction_result,
     )
 
     st.markdown("#### Prediction reliability")
@@ -1649,6 +1718,7 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
             lc_obj=lc_obj,
             auto_feature_report=auto_feature_report,
             source_domain=source_domain,
+            prediction_result=result,
         )
         if auto_feature_report is not None:
             st.info(

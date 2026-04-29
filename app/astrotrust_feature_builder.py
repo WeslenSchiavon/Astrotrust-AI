@@ -120,6 +120,131 @@ def _linear_slope(x: np.ndarray, y: np.ndarray) -> float:
         return 0.0
 
 
+def _safe_auc(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 2:
+        return 0.0
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    try:
+        return float(np.trapezoid(y, x))
+    except AttributeError:
+        return float(np.trapz(y, x))
+
+
+def _width_above_fraction(mjd: np.ndarray, flux: np.ndarray, fraction: float) -> float:
+    mjd = np.asarray(mjd, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+
+    mask = np.isfinite(mjd) & np.isfinite(flux)
+    mjd = mjd[mask]
+    flux = flux[mask]
+
+    if len(mjd) < 2:
+        return 0.0
+
+    baseline = float(np.nanmedian(flux))
+    peak = float(np.nanmax(flux))
+
+    if not np.isfinite(peak) or np.isclose(peak, baseline):
+        return 0.0
+
+    threshold = baseline + fraction * (peak - baseline)
+    active = mjd[flux >= threshold]
+
+    if len(active) < 2:
+        return 0.0
+
+    return float(np.nanmax(active) - np.nanmin(active))
+
+
+def _shape_summary(mjd: np.ndarray, flux: np.ndarray, flux_err: np.ndarray | None = None) -> dict:
+    mjd = np.asarray(mjd, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+
+    mask = np.isfinite(mjd) & np.isfinite(flux)
+    mjd = mjd[mask]
+    flux = flux[mask]
+
+    if flux_err is not None:
+        flux_err = np.asarray(flux_err, dtype=float)[mask]
+    else:
+        flux_err = np.full_like(flux, np.nan, dtype=float)
+
+    if len(mjd) == 0:
+        return {
+            "peak_flux": 0.0,
+            "peak_mjd": 0.0,
+            "time_to_peak": 0.0,
+            "time_after_peak": 0.0,
+            "width_25": 0.0,
+            "width_50": 0.0,
+            "width_75": 0.0,
+            "auc_positive": 0.0,
+            "rise_slope": 0.0,
+            "decline_slope": 0.0,
+            "pre_peak_n": 0.0,
+            "post_peak_n": 0.0,
+            "pre_post_n_ratio": 0.0,
+            "peak_snr": 0.0,
+            "positive_fraction": 0.0,
+            "asymmetry_time": 0.0,
+        }
+
+    idx_peak = int(np.nanargmax(flux))
+    peak_flux = float(flux[idx_peak])
+    peak_mjd = float(mjd[idx_peak])
+
+    mjd_min = float(np.nanmin(mjd))
+    mjd_max = float(np.nanmax(mjd))
+    span = max(mjd_max - mjd_min, EPS)
+
+    pre = mjd <= peak_mjd
+    post = mjd >= peak_mjd
+
+    valid_peak_err = (
+        flux_err is not None
+        and len(flux_err) > idx_peak
+        and np.isfinite(flux_err[idx_peak])
+        and abs(flux_err[idx_peak]) > EPS
+    )
+
+    if valid_peak_err:
+        peak_snr = float(peak_flux / flux_err[idx_peak])
+    else:
+        peak_snr = 0.0
+
+    pre_n = float(np.sum(pre))
+    post_n = float(np.sum(post))
+
+    return {
+        "peak_flux": peak_flux,
+        "peak_mjd": peak_mjd,
+        "time_to_peak": float(peak_mjd - mjd_min),
+        "time_after_peak": float(mjd_max - peak_mjd),
+        "width_25": _width_above_fraction(mjd, flux, 0.25),
+        "width_50": _width_above_fraction(mjd, flux, 0.50),
+        "width_75": _width_above_fraction(mjd, flux, 0.75),
+        "auc_positive": _safe_auc(mjd, np.clip(flux, 0.0, None)),
+        "rise_slope": _linear_slope(mjd[pre], flux[pre]),
+        "decline_slope": _linear_slope(mjd[post], flux[post]),
+        "pre_peak_n": pre_n,
+        "post_peak_n": post_n,
+        "pre_post_n_ratio": float(pre_n / max(post_n, EPS)),
+        "peak_snr": peak_snr,
+        "positive_fraction": float(np.mean(flux > 0.0)),
+        "asymmetry_time": float(((mjd_max - peak_mjd) - (peak_mjd - mjd_min)) / span),
+    }
+
 def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series | dict | None = None) -> dict:
     lc = lc_obj.copy()
 
@@ -154,11 +279,43 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
     features["n_obs"] = float(len(lc))
     features["n_detections"] = float(len(lc))
     features["n_bands"] = float(lc["band"].nunique())
+    features["n_points"] = features["n_obs"]
+    features["n_observations"] = features["n_obs"]
+    features["num_points"] = features["n_obs"]
+    features["num_obs"] = features["n_obs"]
     features["mjd_min"] = float(np.nanmin(mjd))
     features["mjd_max"] = float(np.nanmax(mjd))
     features["mjd_span"] = float(np.nanmax(mjd) - np.nanmin(mjd))
     features["time_span"] = features["mjd_span"]
     features["baseline"] = features["mjd_span"]
+
+    # Cadence features.
+    mjd_sorted = np.sort(mjd[np.isfinite(mjd)])
+    if len(mjd_sorted) >= 2:
+        cadence = np.diff(mjd_sorted)
+        cadence = cadence[np.isfinite(cadence)]
+
+        if len(cadence) > 0:
+            features["mean_cadence"] = float(np.mean(cadence))
+            features["median_cadence"] = float(np.median(cadence))
+            features["std_cadence"] = float(np.std(cadence))
+            features["min_cadence"] = float(np.min(cadence))
+            features["max_cadence"] = float(np.max(cadence))
+            features["cadence_mean"] = features["mean_cadence"]
+            features["cadence_median"] = features["median_cadence"]
+            features["cadence_std"] = features["std_cadence"]
+        else:
+            features["mean_cadence"] = 0.0
+            features["median_cadence"] = 0.0
+            features["std_cadence"] = 0.0
+            features["min_cadence"] = 0.0
+            features["max_cadence"] = 0.0
+    else:
+        features["mean_cadence"] = 0.0
+        features["median_cadence"] = 0.0
+        features["std_cadence"] = 0.0
+        features["min_cadence"] = 0.0
+        features["max_cadence"] = 0.0
 
     flux_stats = _stat_values(flux)
     for key, value in flux_stats.items():
@@ -196,6 +353,38 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
     features["flux_at_peak"] = float(flux[idx_max])
 
     features["slope_global"] = _linear_slope(mjd, flux)
+    features["global_slope"] = features["slope_global"]
+
+    global_shape = _shape_summary(mjd, flux, flux_err)
+
+    for key, value in global_shape.items():
+        features[f"shape_global_{key}"] = value
+
+    features["observed_peak_flux"] = global_shape["peak_flux"]
+    features["observed_peak_snr"] = global_shape["peak_snr"]
+    features["observed_peak_mjd_relative"] = global_shape["time_to_peak"]
+    features["time_after_observed_peak"] = global_shape["time_after_peak"]
+    features["rise_slope_observed"] = global_shape["rise_slope"]
+    features["decline_slope_observed"] = global_shape["decline_slope"]
+    features["relative_peak_position"] = (
+        global_shape["time_to_peak"] / max(features["mjd_span"], EPS)
+    )
+
+    peak_idx = int(np.nanargmax(flux))
+    peak_band = normalize_band(lc.iloc[peak_idx]["band"])
+
+    band_code_map = {
+        "u": 0,
+        "g": 1,
+        "r": 2,
+        "i": 3,
+        "z": 4,
+        "Y": 5,
+    }
+
+    features["observed_peak_band_code"] = float(band_code_map.get(peak_band, -1))
+    for band in BANDS:
+        features[f"shape_peak_band_is_{band}"] = 1.0 if peak_band == band else 0.0
 
     before = lc[lc["mjd"] <= t_peak]
     after = lc[lc["mjd"] >= t_peak]
@@ -203,6 +392,44 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
     features["slope_decline"] = _linear_slope(after["mjd"].to_numpy(), after["flux"].to_numpy())
     features["rise_time"] = float(t_peak - np.nanmin(mjd)) if len(mjd) else 0.0
     features["decline_time"] = float(np.nanmax(mjd) - t_peak) if len(mjd) else 0.0
+
+    # Extra numeric context columns preserved from real survey tables.
+    base_cols = {
+        "object_id",
+        "mjd",
+        "band",
+        "flux",
+        "flux_err",
+        "mag",
+        "mag_err",
+        "band_norm",
+    }
+
+    for col in lc.columns:
+        col_lower = str(col).lower()
+
+        if col_lower in base_cols:
+            continue
+
+        values = pd.to_numeric(lc[col], errors="coerce").to_numpy(dtype=float)
+
+        if not np.isfinite(values).any():
+            continue
+
+        stats = _stat_values(values)
+
+        # Examples generated:
+        # ra_mean, ra_std, dec_mean, dec_std, catflags_mean, etc.
+        for stat_name, stat_value in stats.items():
+            features[f"{col_lower}_{stat_name}"] = stat_value
+
+        # Useful direct aliases.
+        features[col_lower] = stats["mean"]
+        if col_lower == "dec":
+            features["decl"] = stats["mean"]
+            features["decl_mean"] = stats["mean"]
+            features["decl_std"] = stats["std"]
+
 
     # Weighted time moments.
     weights = np.abs(flux)
@@ -219,7 +446,8 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
     # Per-band features and colors.
     band_means = {}
     band_peaks = {}
-
+    band_shapes = {}
+    band_counts = {}
     for band in BANDS:
         sub = lc[lc["band"] == band]
         prefix_variants = [f"{band}", f"band_{band}"]
@@ -247,7 +475,25 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
                 features[f"{prefix}_mjd_max"] = 0.0
                 features[f"{prefix}_mjd_span"] = 0.0
                 features[f"{prefix}_slope"] = 0.0
+        band_mjd = sub["mjd"].to_numpy(dtype=float) if not sub.empty else np.array([])
+        band_flux = sub["flux"].to_numpy(dtype=float) if not sub.empty else np.array([])
+        band_flux_err = sub["flux_err"].to_numpy(dtype=float) if (not sub.empty and "flux_err" in sub.columns) else None
 
+        band_shape = _shape_summary(band_mjd, band_flux, band_flux_err)
+
+        band_shapes[band] = band_shape
+        band_counts[band] = len(sub)
+
+        features[f"n_{band}"] = float(len(sub))
+        features[f"flux_amp_{band}"] = stats["amplitude"]
+        features[f"time_span_{band}"] = (
+            float(sub["mjd"].max() - sub["mjd"].min()) if not sub.empty else 0.0
+        )
+        features[f"time_to_peak_{band}"] = band_shape["time_to_peak"]
+        features[f"peak_flux_{band}"] = band_shape["peak_flux"]
+
+        for key, value in band_shape.items():
+            features[f"shape_{band}_{key}"] = value
     for b1 in BANDS:
         for b2 in BANDS:
             if b1 == b2:
@@ -257,6 +503,39 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
             features[f"{b1}_{b2}_mean_diff"] = band_means[b1] - band_means[b2]
             features[f"{b1}_{b2}_peak_diff"] = band_peaks[b1] - band_peaks[b2]
 
+    band_pairs = [
+        ("u", "g"),
+        ("g", "r"),
+        ("r", "i"),
+        ("i", "z"),
+        ("z", "Y"),
+        ("g", "i"),
+        ("r", "z"),
+    ]
+
+    for b1, b2 in band_pairs:
+        diff = band_means.get(b1, 0.0) - band_means.get(b2, 0.0)
+        denom = abs(band_means.get(b2, 0.0))
+
+        features[f"flux_diff_{b1}_{b2}"] = float(diff)
+        features[f"flux_ratio_{b1}_{b2}"] = float(
+            band_means.get(b1, 0.0) / max(denom, EPS)
+        )
+
+        s1 = band_shapes.get(b1, {})
+        s2 = band_shapes.get(b2, {})
+
+        if band_counts.get(b1, 0) > 0 and band_counts.get(b2, 0) > 0:
+            peak1 = float(s1.get("peak_flux", 0.0))
+            peak2 = float(s2.get("peak_flux", 0.0))
+            mjd1 = float(s1.get("peak_mjd", 0.0))
+            mjd2 = float(s2.get("peak_mjd", 0.0))
+
+            features[f"shape_peak_flux_ratio_{b1}_{b2}"] = peak1 / max(abs(peak2), EPS)
+            features[f"shape_peak_mjd_diff_{b1}_{b2}"] = mjd1 - mjd2
+        else:
+            features[f"shape_peak_flux_ratio_{b1}_{b2}"] = 0.0
+            features[f"shape_peak_mjd_diff_{b1}_{b2}"] = 0.0
     # HEAD/context metadata when available.
     if head_row is not None:
         if isinstance(head_row, pd.Series):
@@ -276,6 +555,11 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
             except Exception:
                 continue
 
+    # Extinction placeholders.
+    # For real scientific use, these should later come from a dust map query.
+    features.setdefault("mwebv", 0.0)
+    features.setdefault("mwebv_err", 0.0)
+    
     return features
 
 
@@ -330,6 +614,19 @@ def _candidate_keys_for_column(column: str) -> list[str]:
             keys.append(f"flux_{stat}")
             keys.append(stat)
 
+    # Direct aliases for common expected columns.
+    alias_map = {
+        "n_points": ["n_points", "n_obs", "n_observations", "num_points", "num_obs"],
+        "mean_cadence": ["mean_cadence", "cadence_mean"],
+        "median_cadence": ["median_cadence", "cadence_median"],
+        "std_cadence": ["std_cadence", "cadence_std"],
+        "ra_mean": ["ra_mean", "ra"],
+        "dec_mean": ["dec_mean", "dec"],
+    }
+
+    if cl in alias_map:
+        keys.extend(alias_map[cl])
+
     # De-duplicate preserving order.
     out = []
     seen = set()
@@ -346,7 +643,13 @@ def classify_feature_origin(feature_name: str) -> str:
         if any(k in name for k in ["host", "gal", "redshift", "photoz", "specz", "z_final"]):
             return "context_host_redshift"
 
-        if any(k in name for k in ["ra", "dec", "coord", "galactic", "lat", "lon", "mwebv"]):
+        if (
+            name in ["ra", "dec", "decl", "mwebv", "mwebv_err"]
+            or name.startswith("ra_")
+            or name.startswith("dec_")
+            or name.startswith("decl_")
+            or any(k in name for k in ["coord", "galactic", "lat", "lon"])
+        ):
             return "context_position_extinction"
 
         if any(k in name for k in ["flux", "snr", "mag", "amplitude", "peak", "median", "mean", "std", "skew", "kurt"]):
@@ -361,6 +664,9 @@ def classify_feature_origin(feature_name: str) -> str:
         if any(k in name for k in ["period", "fft", "lomb", "frequency"]):
             return "periodicity"
 
+        if name.startswith("n_") or name in ["n_points", "n_obs", "n_bands"]:
+            return "lightcurve_multiband"  
+         
         return "unknown"
 
 

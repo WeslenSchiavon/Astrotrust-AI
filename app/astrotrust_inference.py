@@ -402,7 +402,7 @@ class AstroTrustInferenceEngine:
 
         predicted_label = int(np.argmax(probabilities))
         confidence = float(np.max(probabilities))
-        uncertainty = normalized_entropy(probabilities)
+        uncertainty = max(0.0, normalized_entropy(probabilities))
 
         raw_novelty = self._compute_raw_novelty(x_tab_scaled)
         novelty = minmax_transform(raw_novelty, float(self.novelty_norm["min"]), float(self.novelty_norm["max"]))
