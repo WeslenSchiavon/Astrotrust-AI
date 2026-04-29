@@ -340,6 +340,31 @@ def _candidate_keys_for_column(column: str) -> list[str]:
     return out
 
 
+def classify_feature_origin(feature_name: str) -> str:
+        name = str(feature_name).lower()
+
+        if any(k in name for k in ["host", "gal", "redshift", "photoz", "specz", "z_final"]):
+            return "context_host_redshift"
+
+        if any(k in name for k in ["ra", "dec", "coord", "galactic", "lat", "lon", "mwebv"]):
+            return "context_position_extinction"
+
+        if any(k in name for k in ["flux", "snr", "mag", "amplitude", "peak", "median", "mean", "std", "skew", "kurt"]):
+            return "lightcurve_statistical"
+
+        if any(k in name for k in ["rise", "decline", "slope", "duration", "span", "time", "mjd"]):
+            return "lightcurve_temporal_shape"
+
+        if any(k in name for k in ["band", "color", "_u_", "_g_", "_r_", "_i_", "_z_", "_y_"]):
+            return "lightcurve_multiband"
+
+        if any(k in name for k in ["period", "fft", "lomb", "frequency"]):
+            return "periodicity"
+
+        return "unknown"
+
+
+
 def build_v4_feature_row_auto(
     lc_obj: pd.DataFrame,
     head_row: pd.Series | dict | None = None,
@@ -381,17 +406,45 @@ def build_v4_feature_row_auto(
     df = pd.DataFrame([values], columns=expected_columns)
     df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+    feature_coverage_rows = []
+
+    for col in expected_columns:
+        status = "matched" if col in matched else "missing_filled_zero"
+
+        feature_coverage_rows.append(
+            {
+                "feature_name": col,
+                "status": status,
+                "category": classify_feature_origin(col),
+            }
+        )
+
+    feature_coverage = pd.DataFrame(feature_coverage_rows)
+
+    
     report = {
         "n_expected_features": len(expected_columns),
         "n_matched_features": len(matched),
         "n_missing_filled_zero": len(missing),
         "matched_features": matched,
         "missing_features": missing,
+        "feature_coverage": feature_coverage,
+        "missing_by_category": (
+            feature_coverage[feature_coverage["status"] == "missing_filled_zero"]
+            ["category"]
+            .value_counts()
+            .to_dict()
+        ),
+        "matched_by_category": (
+            feature_coverage[feature_coverage["status"] == "matched"]
+            ["category"]
+            .value_counts()
+            .to_dict()
+        ),
         "mode": "auto_lightcurve_v4_approximation",
         "warning": (
             "Automatically generated from available light-curve/HEAD information. "
             "Features requiring external host/context metadata are filled with zero if unavailable."
         ),
     }
-
     return df, report

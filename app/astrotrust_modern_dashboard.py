@@ -220,13 +220,64 @@ def load_lightcurves(path: Path) -> pd.DataFrame:
 
 
 def normalize_band(value):
+    if isinstance(value, bytes):
+        value = value.decode(errors="ignore").strip()
+
     if value in BAND_MAP:
         return BAND_MAP[value]
+
     value_str = str(value).strip()
+
+    if value_str.startswith("b'") and value_str.endswith("'"):
+        value_str = value_str[2:-1]
+
+    if value_str.startswith('b"') and value_str.endswith('"'):
+        value_str = value_str[2:-1]
+
+    aliases = {
+        "zg": "g",
+        "zr": "r",
+        "zi": "i",
+        "ztfg": "g",
+        "ztfr": "r",
+        "ztfi": "i",
+        "ZTF_g": "g",
+        "ZTF_r": "r",
+        "ZTF_i": "i",
+        "g_ZTF": "g",
+        "r_ZTF": "r",
+        "i_ZTF": "i",
+        "sdssg": "g",
+        "sdssr": "r",
+        "sdssi": "i",
+        "sdssz": "z",
+        "u": "u",
+        "g": "g",
+        "r": "r",
+        "i": "i",
+        "z": "z",
+        "y": "Y",
+        "Y": "Y",
+        "B": "B",
+        "V": "V",
+        "R": "r",
+        "I": "i",
+        "Rc": "r",
+        "Ic": "i",
+    }
+
+    if value_str in aliases:
+        return aliases[value_str]
+
+    if value_str.lower() in aliases:
+        return aliases[value_str.lower()]
+
     if value_str in BAND_MAP:
         return BAND_MAP[value_str]
+
     if value_str.lower() == "y":
         return "Y"
+
     return value_str
 
 
@@ -764,6 +815,31 @@ def show_fits_viewer():
                 pass
 
 
+def read_lightcurve_file_from_url(url: str):
+    """Read a generic light-curve table directly from a public URL."""
+    url = str(url).strip()
+
+    if not url:
+        raise ValueError("Empty URL.")
+
+    lower_url = url.lower()
+
+    if "format=csv" in lower_url or lower_url.endswith(".csv"):
+        return pd.read_csv(url), "csv_url"
+
+    if lower_url.endswith(".parquet"):
+        return pd.read_parquet(url), "parquet_url"
+
+    # Many astronomy APIs return CSV even when the URL does not end with .csv.
+    # Try CSV as a practical default.
+    try:
+        return pd.read_csv(url), "csv_url"
+    except Exception as exc:
+        raise ValueError(
+            "Could not read URL as CSV/Parquet. Make sure the URL points to a public table file "
+            "or an API response with FORMAT=CSV."
+        ) from exc
+
 def read_uploaded_lightcurve_file(uploaded):
     """Read CSV, Parquet, or FITS table uploaded by the user."""
     suffix = Path(uploaded.name).suffix.lower()
@@ -838,61 +914,206 @@ def read_lightcurve_file_from_path(path):
     raise ValueError(f"Unsupported file type: {suffix}")
 
 
+
 def infer_lightcurve_columns(df: pd.DataFrame):
     lower_map = {str(c).lower(): c for c in df.columns}
 
     candidates = {
-        "object_id": ["object_id", "objectid", "objid", "diaobjectid", "snid", "id"],
-        "mjd": ["mjd", "time", "t", "jd", "date"],
-        "band": ["band", "filter", "passband", "fid", "flt"],
-        "flux": ["flux", "fluxcal", "flx", "psflux", "forcediffimflux"],
-        "flux_err": ["flux_err", "fluxerr", "flux_error", "fluxcalerr", "psfluxerr", "forcediffimfluxunc"],
+        "object_id": [
+            "object_id",
+            "objectid",
+            "objid",
+            "diaobjectid",
+            "diaobjectId",
+            "snid",
+            "id",
+            "source_id",
+            "oid",
+            "name",
+            "target_name",
+        ],
+        "mjd": [
+            "mjd",
+            "mjdobs",
+            "time",
+            "t",
+            "jd",
+            "hjd",
+            "bjd",
+            "date",
+            "obsjd",
+            "obsmjd",
+        ],
+        "band": [
+            "band",
+            "filter",
+            "passband",
+            "fid",
+            "flt",
+            "filtercode",
+            "filter_code",
+            "filtername",
+            "bandname",
+        ],
+        "flux": [
+            "flux",
+            "fluxcal",
+            "flx",
+            "psflux",
+            "forcediffimflux",
+            "flux_jy",
+            "fnu",
+            "flux_density",
+        ],
+        "flux_err": [
+            "flux_err",
+            "fluxerr",
+            "flux_error",
+            "fluxcalerr",
+            "psfluxerr",
+            "forcediffimfluxunc",
+            "flux_unc",
+            "flux_uncertainty",
+            "fluxerr_jy",
+        ],
+        "mag": [
+            "mag",
+            "magnitude",
+            "magpsf",
+            "psfmag",
+            "mag_auto",
+            "magap",
+            "mag_calibrated",
+            "magnitude_calibrated",
+        ],
+        "mag_err": [
+            "magerr",
+            "mag_err",
+            "mag_error",
+            "sigmapsf",
+            "e_mag",
+            "mag_unc",
+            "magnitude_error",
+            "uncertainty",
+        ],
     }
 
     inferred = {}
+
     for target, names in candidates.items():
         inferred[target] = None
+
         for name in names:
-            if name.lower() in lower_map:
-                inferred[target] = lower_map[name.lower()]
+            if str(name).lower() in lower_map:
+                inferred[target] = lower_map[str(name).lower()]
                 break
 
     return inferred
 
 
+def _convert_magnitude_to_relative_flux(mag, mag_err=None):
+    """Convert magnitude to relative flux.
+
+    The zero point is set from the median magnitude in the uploaded table.
+    This keeps the scale stable even when the real photometric zero point is unknown.
+    """
+    mag = pd.to_numeric(mag, errors="coerce")
+    finite_mag = mag[np.isfinite(mag)]
+
+    if len(finite_mag) == 0:
+        flux = pd.Series(np.nan, index=mag.index)
+        flux_err = pd.Series(np.nan, index=mag.index)
+        return flux, flux_err
+
+    mag0 = float(np.nanmedian(finite_mag))
+    flux = 10.0 ** (-0.4 * (mag - mag0))
+
+    if mag_err is None:
+        flux_err = pd.Series(np.nan, index=mag.index)
+    else:
+        mag_err = pd.to_numeric(mag_err, errors="coerce")
+        flux_err = flux * 0.4 * np.log(10.0) * mag_err
+
+    return flux, flux_err
+
+
 def normalize_uploaded_lightcurve(df: pd.DataFrame, inferred: dict):
     issues = []
-    required = ["mjd", "band", "flux"]
-    missing = [col for col in required if inferred.get(col) is None]
+
+    has_flux = inferred.get("flux") is not None
+    has_mag = inferred.get("mag") is not None
+
+    missing = []
+
+    if inferred.get("mjd") is None:
+        missing.append("mjd/time")
+
+    if inferred.get("band") is None:
+        missing.append("band/filter")
+
+    if not has_flux and not has_mag:
+        missing.append("flux or mag")
 
     if missing:
         issues.append(f"Missing required light-curve columns: {', '.join(missing)}")
         return pd.DataFrame(), issues
 
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
+
     if inferred.get("object_id") is not None:
-        out["object_id"] = df[inferred["object_id"]]
+        out["object_id"] = df[inferred["object_id"]].astype(str)
     else:
-        out["object_id"] = 0
+        out["object_id"] = "single_object"
         issues.append("No object_id column found; treating the file as a single object.")
 
     out["mjd"] = pd.to_numeric(df[inferred["mjd"]], errors="coerce")
     out["band"] = df[inferred["band"]].map(normalize_band)
-    out["flux"] = pd.to_numeric(df[inferred["flux"]], errors="coerce")
 
-    if inferred.get("flux_err") is not None:
-        out["flux_err"] = pd.to_numeric(df[inferred["flux_err"]], errors="coerce")
+    if has_flux:
+        out["flux"] = pd.to_numeric(df[inferred["flux"]], errors="coerce")
+
+        if inferred.get("flux_err") is not None:
+            out["flux_err"] = pd.to_numeric(df[inferred["flux_err"]], errors="coerce")
+        else:
+            out["flux_err"] = np.nan
+            issues.append(
+                "No flux uncertainty column found; plotting will work, but SNR/tensor construction will be incomplete."
+            )
+
     else:
-        out["flux_err"] = np.nan
-        issues.append("No flux uncertainty column found; plotting will work, but SNR/tensor construction will be incomplete.")
+        mag = pd.to_numeric(df[inferred["mag"]], errors="coerce")
+
+        if inferred.get("mag_err") is not None:
+            mag_err = pd.to_numeric(df[inferred["mag_err"]], errors="coerce")
+        else:
+            mag_err = None
+
+        flux, flux_err = _convert_magnitude_to_relative_flux(mag, mag_err)
+
+        out["flux"] = flux
+        out["flux_err"] = flux_err
+        out["mag"] = mag
+
+        if mag_err is not None:
+            out["mag_err"] = mag_err
+
+        issues.append(
+            "Input used magnitude columns. Converted mag/magerr to relative flux/flux_err automatically."
+        )
+
+    if "flux_err" in out.columns:
+        out["flux_err"] = pd.to_numeric(out["flux_err"], errors="coerce")
+        out.loc[out["flux_err"] <= 0, "flux_err"] = np.nan
 
     before = len(out)
-    out = out.dropna(subset=["mjd", "flux"])
+    out = out.dropna(subset=["mjd", "flux"]).reset_index(drop=True)
     dropped = before - len(out)
+
     if dropped > 0:
-        issues.append(f"Dropped {dropped} rows with invalid mjd or flux values.")
+        issues.append(f"Dropped {dropped} rows with invalid mjd/flux values.")
 
     return out, issues
+
 
 
 def plot_uploaded_lightcurve(lc: pd.DataFrame, title="Uploaded light curve"):
@@ -929,6 +1150,163 @@ def plot_uploaded_lightcurve(lc: pd.DataFrame, title="Uploaded light curve"):
     )
     st.plotly_chart(fig, use_container_width=True)
 
+
+def summarize_uploaded_objects(lc: pd.DataFrame) -> pd.DataFrame:
+    """Rank objects by usefulness for prediction.
+
+    Best object = more bands, then more observations, then longer time span.
+    """
+    rows = []
+
+    for object_id, group in lc.groupby("object_id"):
+        n_obs = len(group)
+        n_bands = group["band"].nunique()
+
+        if "mjd" in group.columns and len(group) > 1:
+            time_span = float(group["mjd"].max() - group["mjd"].min())
+        else:
+            time_span = 0.0
+
+        rows.append(
+            {
+                "object_id": str(object_id),
+                "n_obs": int(n_obs),
+                "n_bands": int(n_bands),
+                "time_span": time_span,
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+
+    if summary.empty:
+        return summary
+
+    summary = summary.sort_values(
+        ["n_bands", "n_obs", "time_span"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    return summary
+
+
+def compute_prediction_reliability(
+    lc_obj: pd.DataFrame,
+    auto_feature_report=None,
+    source_domain="generic",
+):
+    """Compute a user-facing reliability flag for the current prediction."""
+    n_obs = len(lc_obj)
+    n_bands = lc_obj["band"].nunique() if "band" in lc_obj.columns else 0
+
+    if "mjd" in lc_obj.columns and len(lc_obj) > 1:
+        time_span = float(lc_obj["mjd"].max() - lc_obj["mjd"].min())
+    else:
+        time_span = 0.0
+
+    reasons = []
+    score = 3
+
+    if n_obs < 10:
+        score = min(score, 1)
+        reasons.append("Very few observations.")
+    elif n_obs < 30:
+        score = min(score, 2)
+        reasons.append("Limited number of observations.")
+
+    if n_bands < 2:
+        score = min(score, 2)
+        reasons.append("Single-band input. The model was trained mostly for multiband light curves.")
+
+    if time_span <= 0:
+        score = min(score, 1)
+        reasons.append("Invalid or zero time span.")
+
+    if source_domain == "generic":
+        score = min(score, 2)
+        reasons.append(
+            "Generic real-survey input may be out-of-domain relative to the ELAsTiCC/LSST-like training data."
+        )
+
+    if auto_feature_report is not None:
+        n_expected = auto_feature_report.get("n_expected_features", 0)
+        n_missing = auto_feature_report.get("n_missing_filled_zero", 0)
+
+        if n_expected > 0:
+            missing_frac = n_missing / n_expected
+
+            if missing_frac > 0.50:
+                score = min(score, 2)
+                reasons.append(
+                    f"Many tabular/context features were auto-filled with zero ({n_missing}/{n_expected})."
+                )
+
+            elif missing_frac > 0.25:
+                score = min(score, 2)
+                reasons.append(
+                    f"Some tabular/context features were auto-filled with zero ({n_missing}/{n_expected})."
+                )
+
+    if score >= 3:
+        level = "Good"
+    elif score == 2:
+        level = "Limited"
+    else:
+        level = "Low"
+
+    if not reasons:
+        reasons.append("Input has enough observations, multiple bands, and no major reliability warning.")
+
+    return {
+        "level": level,
+        "n_obs": n_obs,
+        "n_bands": n_bands,
+        "time_span": time_span,
+        "reasons": reasons,
+    }
+
+
+def display_prediction_reliability(
+    lc_obj: pd.DataFrame,
+    auto_feature_report=None,
+    source_domain="generic",
+):
+    reliability = compute_prediction_reliability(
+        lc_obj=lc_obj,
+        auto_feature_report=auto_feature_report,
+        source_domain=source_domain,
+    )
+
+    st.markdown("#### Prediction reliability")
+
+    level = reliability["level"]
+
+    if level == "Good":
+        st.success("Prediction reliability: Good")
+    elif level == "Limited":
+        st.warning("Prediction reliability: Limited")
+    else:
+        st.error("Prediction reliability: Low")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.metric("Reliability", level)
+    with c2:
+        st.metric("Bands", reliability["n_bands"])
+    with c3:
+        safe_metric("Time span", reliability["time_span"])
+
+    reason_df = pd.DataFrame(
+        [{"reason": reason} for reason in reliability["reasons"]]
+    )
+
+    st.dataframe(reason_df, use_container_width=True, hide_index=True)
+
+    if source_domain == "generic":
+        st.info(
+            "This is a real/generic light-curve input. Treat the result as triage support, "
+            "not as a final scientific classification without follow-up validation."
+        )
 
 def show_snana_elasticc_pair_upload():
     st.markdown("### SNANA / ELAsTiCC HEAD + PHOT pair")
@@ -1084,10 +1462,28 @@ def show_snana_elasticc_pair_upload():
             if not matches.empty:
                 head_row = matches.iloc[0]
                 break
-    render_prediction_panel(lc_obj, selected_object, head_row=head_row)
+    
+    head_row = None
+    for candidate_col in ["SNID", "object_id", "OBJECT_ID", "DIAOBJECTID", "diaObjectId"]:
+        if candidate_col in head_df.columns:
+            matches = head_df[
+                head_df[candidate_col].astype(str).str.strip()
+                == str(selected_object).strip()
+            ]
+
+            if not matches.empty:
+                head_row = matches.iloc[0]
+                break
+            
+    render_prediction_panel(
+        lc_obj,
+        selected_object,
+        head_row=head_row,
+        source_domain="snana_elasticc",
+    )
 
 
-def render_prediction_panel(lc_obj, selected_object, head_row=None):
+def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domain="generic"):
     st.markdown("#### AstroTrust-AI prediction")
 
     if not HAS_SNANA_UTILS:
@@ -1205,10 +1601,10 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None):
 
             if use_auto_builder:
                 tabular_features, auto_feature_report = build_v4_feature_row_auto(
-                    lc_obj=lc_obj,
-                    head_row=head_row,
-                    expected_columns=engine.tabular_columns,
-                )
+                lc_obj=lc_obj,
+                head_row=head_row,
+                expected_columns=engine.tabular_columns,
+            )
                 allow_zero_tabular = False
 
             elif use_precomputed_features:
@@ -1249,6 +1645,11 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None):
         with c3:
             st.metric("Rarity", f"{result['rarity_score']:.4f}")
 
+        display_prediction_reliability(
+            lc_obj=lc_obj,
+            auto_feature_report=auto_feature_report,
+            source_domain=source_domain,
+        )
         if auto_feature_report is not None:
             st.info(
                 f"Auto-built v4 features: "
@@ -1264,9 +1665,25 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None):
                     "n_expected_features": auto_feature_report["n_expected_features"],
                     "n_matched_features": auto_feature_report["n_matched_features"],
                     "n_missing_filled_zero": auto_feature_report["n_missing_filled_zero"],
-                    "matched_features_preview": auto_feature_report["matched_features"][:100],
-                    "missing_features_preview": auto_feature_report["missing_features"][:100],
+                    "matched_by_category": auto_feature_report.get("matched_by_category", {}),
+                    "missing_by_category": auto_feature_report.get("missing_by_category", {}),
                 })
+
+                if "feature_coverage" in auto_feature_report:
+                    coverage_df = auto_feature_report["feature_coverage"]
+
+                    st.markdown("##### Feature coverage table")
+                    st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+
+                    csv = coverage_df.to_csv(index=False).encode("utf-8")
+
+                    st.download_button(
+                        "Download feature coverage CSV",
+                        data=csv,
+                        file_name=f"astrotrust_feature_coverage_{selected_object}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
         if result.get("used_zero_tabular_preview"):
             st.warning(
                 "This result used zero-filled tabular/context features. "
@@ -1323,7 +1740,7 @@ def show_upload_alert_lightcurve():
 
     input_mode = st.radio(
         "Input mode",
-        ["Browser upload", "Local file path"],
+        ["Browser upload", "Local file path", "URL"],
         horizontal=True,
         key="lightcurve_input_mode",
     )
@@ -1351,7 +1768,8 @@ def show_upload_alert_lightcurve():
                 | Time | `mjd`, `time`, `jd` |
                 | Band/filter | `band`, `filter`, `passband`, `fid` |
                 | Flux | `flux`, `fluxcal`, `forcediffimflux` |
-                | Flux uncertainty | `flux_err`, `fluxerr`, `fluxcalerr`, `forcediffimfluxunc` |
+                | Magnitude | `mag`, `magpsf`, `psfmag`, `magnitude` |
+                | Uncertainty | `flux_err`, `fluxerr`, `magerr`, `sigmapsf` |
                 | Object identifier | `object_id`, `diaObjectId`, `SNID` |
                 """
             )
@@ -1364,7 +1782,7 @@ def show_upload_alert_lightcurve():
             st.error(f"Could not read uploaded file: {exc}")
             return
 
-    else:
+    elif input_mode == "Local file path":
         local_file = interactive_local_file_picker(
             label="Local light-curve path",
             suffixes=[".csv", ".parquet", ".fits", ".fit", ".fts"],
@@ -1381,6 +1799,29 @@ def show_upload_alert_lightcurve():
             source_label = str(local_file)
         except Exception as exc:
             st.error(f"Could not read local file: {exc}")
+            return
+
+    else:
+        st.info(
+            "Paste a public URL pointing to a CSV/Parquet light-curve table. "
+            "For IRSA/ZTF, use a URL with FORMAT=CSV."
+        )
+
+        url = st.text_input(
+            "Light-curve table URL",
+            placeholder="https://irsa.ipac.caltech.edu/cgi-bin/ZTF/nph_light_curves?...&FORMAT=CSV",
+            key="lightcurve_url",
+        )
+
+        if not url:
+            return
+
+        try:
+            with st.spinner("Downloading light-curve table from URL..."):
+                raw_df, source_type = read_lightcurve_file_from_url(url)
+                source_label = url
+        except Exception as exc:
+            st.error(f"Could not read URL: {exc}")
             return
 
     st.success(f"Loaded `{source_label}` as `{source_type}` with {len(raw_df):,} rows and {len(raw_df.columns):,} columns.")
@@ -1405,20 +1846,35 @@ def show_upload_alert_lightcurve():
         st.error("The uploaded file could not be converted into a valid light curve.")
         return
 
-    object_values = sorted(pd.Series(lc["object_id"]).dropna().unique().tolist())
+   
+    object_summary = summarize_uploaded_objects(lc)
 
-    if len(object_values) == 0:
+    if object_summary.empty:
         selected_object = "single_object"
         lc["object_id"] = selected_object
         lc_obj = lc
 
-    elif len(object_values) > 1:
-        selected_object = st.selectbox("Select object", object_values)
-        lc_obj = lc[lc["object_id"] == selected_object]
-
     else:
-        selected_object = object_values[0]
-        lc_obj = lc
+        object_values = object_summary["object_id"].tolist()
+
+        def format_object_option(object_id):
+            row = object_summary[object_summary["object_id"] == str(object_id)].iloc[0]
+            return (
+                f"{row['object_id']}  |  "
+                f"bands={row['n_bands']}  |  "
+                f"obs={row['n_obs']}  |  "
+                f"span={row['time_span']:.1f}"
+            )
+
+        selected_object = st.selectbox(
+            "Select object",
+            object_values,
+            index=0,
+            format_func=format_object_option,
+            help="Objects are sorted automatically by number of bands, observations, and time span.",
+        )
+
+        lc_obj = lc[lc["object_id"].astype(str) == str(selected_object)].copy()
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1434,14 +1890,44 @@ def show_upload_alert_lightcurve():
 
     st.markdown("#### Prediction readiness")
     checks = pd.DataFrame([
-        {"check": "Has time, band, and flux", "status": "OK" if all(inferred.get(c) is not None for c in ["mjd", "band", "flux"]) else "Missing"},
-        {"check": "Has flux uncertainty", "status": "OK" if inferred.get("flux_err") is not None else "Recommended"},
-        {"check": "At least 10 observations", "status": "OK" if len(lc_obj) >= 10 else "Low"},
-        {"check": "At least 2 bands", "status": "OK" if lc_obj["band"].nunique() >= 2 else "Low"},
+        {
+            "check": "Has time, band, and flux/mag",
+            "status": "OK"
+            if (
+                inferred.get("mjd") is not None
+                and inferred.get("band") is not None
+                and (
+                    inferred.get("flux") is not None
+                    or inferred.get("mag") is not None
+                )
+            )
+            else "Missing",
+        },
+        {
+            "check": "Has flux or magnitude uncertainty",
+            "status": "OK"
+            if (
+                inferred.get("flux_err") is not None
+                or inferred.get("mag_err") is not None
+            )
+            else "Recommended",
+        },
+        {
+            "check": "At least 10 observations",
+            "status": "OK" if len(lc_obj) >= 10 else "Low",
+        },
+        {
+            "check": "At least 2 bands",
+            "status": "OK" if lc_obj["band"].nunique() >= 2 else "Low",
+        },
     ])
     st.dataframe(checks, use_container_width=True, hide_index=True)
 
-    render_prediction_panel(lc_obj, selected_object)
+    render_prediction_panel(
+        lc_obj,
+        selected_object,
+        source_domain="generic",
+    )
     return
 
 def show_overview(assets):
