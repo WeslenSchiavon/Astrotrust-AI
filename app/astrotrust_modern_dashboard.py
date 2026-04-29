@@ -1,0 +1,1279 @@
+from pathlib import Path
+import tempfile
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+
+try:
+    from astropy.io import fits
+    HAS_ASTROPY = True
+except ImportError:
+    HAS_ASTROPY = False
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+CACHE_DIR = ROOT_DIR / "data" / "processed" / "elasticc2_large" / "dashboard_cache"
+
+POLICY_FILES = {
+    "Novelty + rarity": "hybrid_test_ranking_novelty_rarity.csv",
+    "Rarity only": "hybrid_test_ranking_rarity_only.csv",
+    "Previous discovery": "hybrid_test_ranking_previous_discovery.csv",
+    "Fixed discovery": "hybrid_test_ranking_fixed_discovery.csv",
+}
+
+BAND_MAP = {
+    "0": "u", "1": "g", "2": "r", "3": "i", "4": "z", "5": "Y",
+    0: "u", 1: "g", 2: "r", 3: "i", 4: "z", 5: "Y",
+}
+
+st.set_page_config(
+    page_title="AstroTrust-AI",
+    page_icon="🔭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+CUSTOM_CSS = """
+<style>
+    .main {
+        background: linear-gradient(135deg, #070B18 0%, #10172A 45%, #111827 100%);
+        color: #E5E7EB;
+    }
+
+    [data-testid="stSidebar"] {
+        background: #08111F;
+        border-right: 1px solid rgba(148, 163, 184, 0.18);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(7, 11, 24, 0.72);
+        backdrop-filter: blur(10px);
+    }
+
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1500px;
+    }
+
+    .hero {
+        padding: 1.6rem 1.8rem;
+        border-radius: 28px;
+        background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.25), transparent 32%),
+                    linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.86));
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.30);
+        margin-bottom: 1rem;
+    }
+
+    .hero h1 {
+        margin: 0;
+        font-size: 2.2rem;
+        letter-spacing: -0.04em;
+        color: #F8FAFC;
+    }
+
+    .hero p {
+        margin-top: 0.55rem;
+        margin-bottom: 0;
+        color: #CBD5E1;
+        font-size: 1.02rem;
+        line-height: 1.55;
+    }
+
+    .chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+        margin-top: 1rem;
+    }
+
+    .chip {
+        padding: 0.35rem 0.68rem;
+        border-radius: 999px;
+        background: rgba(14, 165, 233, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        color: #BAE6FD;
+        font-size: 0.82rem;
+    }
+
+    .section-card {
+        padding: 1.2rem;
+        border-radius: 24px;
+        background: rgba(15, 23, 42, 0.78);
+        border: 1px solid rgba(148, 163, 184, 0.15);
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
+        margin-bottom: 1rem;
+    }
+
+    .small-caption {
+        color: #94A3B8;
+        font-size: 0.88rem;
+        margin-top: -0.25rem;
+        margin-bottom: 0.75rem;
+    }
+
+    div[data-testid="stMetric"] {
+        background: rgba(15, 23, 42, 0.84);
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        border-radius: 22px;
+        padding: 1rem 1.1rem;
+        box-shadow: 0 10px 35px rgba(0, 0, 0, 0.18);
+    }
+
+    div[data-testid="stMetric"] label {
+        color: #CBD5E1 !important;
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: #F8FAFC !important;
+    }
+
+    .stDataFrame {
+        border-radius: 18px;
+        overflow: hidden;
+    }
+
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.35rem;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 999px;
+        padding: 0.55rem 1.0rem;
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.14);
+        color: #CBD5E1;
+    }
+
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, rgba(14, 165, 233, 0.28), rgba(99, 102, 241, 0.22));
+        color: #F8FAFC;
+    }
+
+    .status-good {
+        color: #86EFAC;
+        font-weight: 600;
+    }
+
+    .status-warn {
+        color: #FDE68A;
+        font-weight: 600;
+    }
+
+    .status-bad {
+        color: #FCA5A5;
+        font-weight: 600;
+    }
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_lightcurves(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+
+def normalize_band(value):
+    if value in BAND_MAP:
+        return BAND_MAP[value]
+    value_str = str(value).strip()
+    if value_str in BAND_MAP:
+        return BAND_MAP[value_str]
+    if value_str.lower() == "y":
+        return "Y"
+    return value_str
+
+
+def safe_metric(label, value, fmt="{:.4f}"):
+    if value is None or pd.isna(value):
+        st.metric(label, "—")
+    elif isinstance(value, (float, np.floating)):
+        st.metric(label, fmt.format(float(value)))
+    else:
+        st.metric(label, value)
+
+
+def load_class_names():
+    path = CACHE_DIR / "full_class_counts.csv"
+    if not path.exists():
+        return {}
+    df = load_csv(path)
+    if {"label", "class_name"}.issubset(df.columns):
+        return dict(zip(df["label"].astype(int), df["class_name"].astype(str)))
+    return {}
+
+
+def add_class_names(df: pd.DataFrame, class_names: dict) -> pd.DataFrame:
+    out = df.copy()
+    if "true_label" in out.columns:
+        out["true_class_name"] = out["true_label"].map(lambda x: class_names.get(int(x), str(x)))
+    if "predicted_label" in out.columns:
+        out["predicted_class_name"] = out["predicted_label"].map(lambda x: class_names.get(int(x), str(x)))
+    return out
+
+
+def load_dashboard_assets():
+    assets = {}
+    filenames = {
+        "performance": "final_model_performance_summary.csv",
+        "calibration": "final_hybrid_calibration_summary.csv",
+        "policy_summary": "final_followup_policy_summary.csv",
+        "selected_policies": "final_selected_followup_policies.csv",
+        "scoring": "dashboard_scoring_table.csv",
+    }
+    for key, filename in filenames.items():
+        path = CACHE_DIR / filename
+        assets[key] = load_csv(path) if path.exists() else pd.DataFrame()
+    return assets
+
+
+def load_ranking(policy_label: str) -> pd.DataFrame:
+    ranking_path = CACHE_DIR / POLICY_FILES[policy_label]
+    if ranking_path.exists():
+        ranking = load_csv(ranking_path)
+    else:
+        fallback = CACHE_DIR / "dashboard_scoring_table.csv"
+        ranking = load_csv(fallback) if fallback.exists() else pd.DataFrame()
+        if not ranking.empty and "priority_score" not in ranking.columns:
+            ranking["priority_score"] = 0.5 * ranking.get("novelty_score", 0.0) + 0.5 * ranking.get("rarity_score", 0.0)
+            ranking = ranking.sort_values("priority_score", ascending=False).reset_index(drop=True)
+            ranking["priority_rank"] = np.arange(1, len(ranking) + 1)
+    return ranking
+
+
+def plot_model_performance(perf: pd.DataFrame):
+    if perf.empty or "macro_f1" not in perf.columns:
+        st.info("Model performance summary is not available.")
+        return
+
+    plot_df = perf.sort_values("macro_f1", ascending=True)
+    fig = px.bar(
+        plot_df,
+        x="macro_f1",
+        y="model",
+        orientation="h",
+        color="family" if "family" in plot_df.columns else None,
+        hover_data=[c for c in ["accuracy", "balanced_accuracy", "weighted_f1", "dataset"] if c in plot_df.columns],
+        title="Model comparison by Macro-F1",
+    )
+    fig.update_layout(
+        height=460,
+        yaxis_title="",
+        xaxis_title="Macro-F1",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#E5E7EB"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_calibration(cal: pd.DataFrame):
+    if cal.empty or "ece" not in cal.columns:
+        st.info("Calibration summary is not available.")
+        return
+
+    fig = px.bar(
+        cal,
+        x="model",
+        y="ece",
+        hover_data=[c for c in ["accuracy", "macro_f1", "brier_score", "mean_confidence"] if c in cal.columns],
+        title="Expected Calibration Error (lower is better)",
+    )
+    fig.update_layout(
+        height=380,
+        xaxis_title="",
+        yaxis_title="ECE",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#E5E7EB"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_policy_enrichment(policy_summary: pd.DataFrame):
+    if policy_summary.empty or "weighted_rare_enrichment" not in policy_summary.columns:
+        st.info("Follow-up policy summary is not available.")
+        return
+
+    fig = px.bar(
+        policy_summary.sort_values("weighted_rare_enrichment", ascending=True),
+        x="weighted_rare_enrichment",
+        y="configuration",
+        orientation="h",
+        hover_data=[c for c in ["weighted_uncertainty", "weighted_novelty", "w_uncertainty", "w_novelty", "w_rarity"] if c in policy_summary.columns],
+        title="Rare-class enrichment by follow-up policy",
+    )
+    fig.update_layout(
+        height=380,
+        yaxis_title="",
+        xaxis_title="Weighted rare enrichment",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#E5E7EB"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_light_curve(lc_object: pd.DataFrame):
+    if lc_object.empty:
+        st.warning("No light-curve data found for this object.")
+        return
+
+    lc = lc_object.copy()
+    lc["band_display"] = lc["band"].map(normalize_band) if "band" in lc.columns else "unknown"
+    lc = lc.sort_values("mjd") if "mjd" in lc.columns else lc
+
+    error_col = next((c for c in ["flux_err", "fluxerr", "flux_error"] if c in lc.columns), None)
+
+    fig = go.Figure()
+    for band, group in lc.groupby("band_display"):
+        if error_col:
+            fig.add_trace(
+                go.Scatter(
+                    x=group["mjd"],
+                    y=group["flux"],
+                    error_y=dict(type="data", array=group[error_col], visible=True),
+                    mode="markers+lines",
+                    name=str(band),
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(x=group["mjd"], y=group["flux"], mode="markers+lines", name=str(band))
+            )
+
+    fig.update_layout(
+        title="Multiband light curve",
+        xaxis_title="MJD",
+        yaxis_title="Flux",
+        height=520,
+        legend_title="Band",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,0.42)",
+        font=dict(color="#E5E7EB"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def summarize_fits_hdus(hdul):
+    rows = []
+    for i, hdu in enumerate(hdul):
+        data = hdu.data
+        header = hdu.header
+        shape = None if data is None else tuple(data.shape)
+        rows.append({
+            "index": i,
+            "name": hdu.name,
+            "type": type(hdu).__name__,
+            "shape": str(shape),
+            "naxis": header.get("NAXIS", None),
+            "object": header.get("OBJECT", ""),
+            "instrument": header.get("INSTRUME", ""),
+            "bunit": header.get("BUNIT", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def robust_image_scale(image):
+    arr = np.asarray(image, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return arr, 0.0, 1.0
+    vmin, vmax = np.nanpercentile(finite, [1, 99])
+    if np.isclose(vmin, vmax):
+        vmin, vmax = np.nanmin(finite), np.nanmax(finite)
+    return arr, vmin, vmax
+
+
+
+@st.cache_data(show_spinner=False)
+def scan_local_files(folder_str: str, suffixes: tuple, recursive: bool, max_files: int) -> pd.DataFrame:
+    folder = Path(folder_str).expanduser()
+
+    if not folder.exists() or not folder.is_dir():
+        return pd.DataFrame(columns=["path", "name", "folder", "size_mb", "modified"])
+
+    files = []
+    for suffix in suffixes:
+        pattern = f"**/*{suffix}" if recursive else f"*{suffix}"
+        files.extend(folder.glob(pattern))
+
+    rows = []
+    for p in files:
+        try:
+            stat = p.stat()
+            rows.append({
+                "path": str(p),
+                "name": p.name,
+                "folder": str(p.parent),
+                "size_mb": stat.st_size / (1024 * 1024),
+                "modified": stat.st_mtime,
+            })
+        except OSError:
+            continue
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["path", "name", "folder", "size_mb", "modified"])
+
+    df = df.sort_values("modified", ascending=False).head(max_files).reset_index(drop=True)
+    return df
+
+
+def native_file_picker_dialog(suffixes, initial_dir):
+    """Open a native OS file picker and return the selected local path.
+
+    This works when Streamlit is running on the same desktop machine as the user.
+    It is not suitable for remote/cloud deployments because the dialog opens on the server.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError(f"tkinter is not available: {exc}")
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    filetypes = [
+        ("Compatible files", " ".join([f"*{s}" for s in suffixes])),
+        ("All files", "*.*"),
+    ]
+
+    selected = filedialog.askopenfilename(
+        title="Select local file",
+        initialdir=str(initial_dir),
+        filetypes=filetypes,
+    )
+
+    root.destroy()
+
+    if not selected:
+        return None
+
+    return Path(selected)
+
+
+def interactive_local_file_picker(label: str, suffixes, default_dir: str, key_prefix: str):
+    """User-friendly local file selection for large files.
+
+    Browser apps cannot use st.file_uploader to return the full local path for security reasons.
+    In local desktop mode, we can open a native OS file picker with tkinter and store the selected path.
+    """
+    default_dir_path = Path(default_dir).expanduser()
+
+    selection_mode = st.radio(
+        "Local selection mode",
+        ["Native file picker", "Browse folder", "Paste full path"],
+        horizontal=True,
+        key=f"{key_prefix}_selection_mode",
+    )
+
+    session_key = f"{key_prefix}_selected_native_path"
+
+    if selection_mode == "Native file picker":
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            open_clicked = st.button("Choose file…", key=f"{key_prefix}_open_native_dialog", use_container_width=True)
+        with c2:
+            current = st.session_state.get(session_key, "")
+            st.text_input("Selected file", value=current, key=f"{key_prefix}_native_path_display", disabled=True)
+
+        if open_clicked:
+            try:
+                selected = native_file_picker_dialog(suffixes=suffixes, initial_dir=default_dir_path)
+                if selected is not None:
+                    st.session_state[session_key] = str(selected)
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not open native file picker: {exc}")
+                st.info("Use 'Paste full path' as a fallback.")
+                return None
+
+        selected_path = st.session_state.get(session_key)
+        if not selected_path:
+            st.info("Click **Choose file…** to open the native file selection window.")
+            return None
+
+        return Path(selected_path)
+
+    if selection_mode == "Paste full path":
+        local_path = st.text_input(
+            label,
+            placeholder="C:/Users/wesle/Desktop/dados/example.fits",
+            key=f"{key_prefix}_direct_path",
+        )
+        if not local_path:
+            return None
+        return Path(local_path.strip().strip('"')).expanduser()
+
+    folder = st.text_input(
+        "Folder to browse",
+        value=default_dir,
+        key=f"{key_prefix}_folder",
+        help="Choose a folder that contains the files. Keep recursive search off for very large directories.",
+    )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        recursive = st.checkbox("Search subfolders", value=False, key=f"{key_prefix}_recursive")
+    with c2:
+        max_files = st.number_input("Max files to list", min_value=10, max_value=5000, value=300, step=10, key=f"{key_prefix}_max_files")
+
+    if not folder:
+        return None
+
+    folder_path = Path(folder).expanduser()
+    if not folder_path.exists() or not folder_path.is_dir():
+        st.error(f"Folder not found: {folder_path}")
+        return None
+
+    with st.spinner("Scanning folder..."):
+        files_df = scan_local_files(str(folder_path), tuple(suffixes), bool(recursive), int(max_files))
+
+    if files_df.empty:
+        st.warning(f"No compatible files found in: {folder_path}")
+        return None
+
+    def fmt(path_str):
+        row = files_df[files_df["path"] == path_str].iloc[0]
+        return f"{row['name']}  —  {row['size_mb']:.1f} MB  —  {row['folder']}"
+
+    selected = st.selectbox(
+        "Select file",
+        files_df["path"].tolist(),
+        format_func=fmt,
+        key=f"{key_prefix}_selected_file",
+    )
+
+    with st.expander("Files found", expanded=False):
+        preview = files_df.copy()
+        preview["size_mb"] = preview["size_mb"].map(lambda x: f"{x:.1f}")
+        st.dataframe(preview[["name", "size_mb", "folder", "path"]], use_container_width=True, hide_index=True)
+
+    return Path(selected)
+
+
+def show_fits_viewer():
+    st.markdown("### Advanced Data Inspector")
+    st.caption(
+        "Inspect generic astronomical FITS files, including images, tables, and datacubes. "
+        "For multi-GB FITS files, prefer local path mode instead of browser upload."
+    )
+
+    if not HAS_ASTROPY:
+        st.error("Astropy is not installed. Run: pip install astropy")
+        return
+
+    input_mode = st.radio(
+        "Input mode",
+        ["Browser upload", "Local file path"],
+        horizontal=True,
+        key="fits_input_mode",
+    )
+
+    tmp_path = None
+    fits_path = None
+
+    if input_mode == "Browser upload":
+        uploaded = st.file_uploader("Upload a FITS file", type=["fits", "fit", "fts"], key="fits_upload")
+        if uploaded is None:
+            st.info("Upload a FITS file to inspect headers, images, tables, or datacube slices.")
+            return
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".fits") as tmp:
+            tmp.write(uploaded.read())
+            tmp_path = Path(tmp.name)
+            fits_path = tmp_path
+
+    else:
+        fits_path = interactive_local_file_picker(
+            label="Local FITS path",
+            suffixes=[".fits", ".fit", ".fts"],
+            default_dir=str(Path.home()),
+            key_prefix="fits_local",
+        )
+
+        if fits_path is None:
+            st.info("Browse a folder or paste the full local path of a FITS file. This is recommended for multi-GB datacubes.")
+            return
+
+        if not fits_path.exists():
+            st.error(f"File not found: {fits_path}")
+            return
+
+        if fits_path.suffix.lower() not in [".fits", ".fit", ".fts"]:
+            st.warning("The file extension is not a standard FITS extension, but the viewer will still try to open it.")
+
+    try:
+        with fits.open(fits_path, memmap=True) as hdul:
+            summary = summarize_fits_hdus(hdul)
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            hdu_index = st.selectbox(
+                "Select HDU",
+                summary["index"].tolist(),
+                format_func=lambda i: f"{i}: {summary.loc[summary['index'] == i, 'name'].iloc[0]} | {summary.loc[summary['index'] == i, 'shape'].iloc[0]}",
+            )
+
+            hdu = hdul[int(hdu_index)]
+            data = hdu.data
+            header = hdu.header
+
+            with st.expander("Header preview", expanded=False):
+                header_rows = [{"keyword": k, "value": str(v)} for k, v in list(header.items())[:250]]
+                st.dataframe(pd.DataFrame(header_rows), use_container_width=True, hide_index=True)
+
+            if data is None:
+                st.warning("Selected HDU has no data.")
+                return
+
+            if hasattr(data, "columns"):
+                max_rows = st.slider("Rows to preview", 50, 5000, 500, step=50, key="fits_table_preview_rows")
+                table_df = pd.DataFrame(np.array(data[:max_rows]).byteswap().newbyteorder())
+                st.markdown("#### FITS table preview")
+                st.dataframe(table_df, use_container_width=True)
+                st.info(
+                    "If this table contains columns like object_id, mjd, band, flux, and flux_err, "
+                    "use the Upload Alert / Light Curve tab to validate it as a potential AstroTrust-AI input."
+                )
+                return
+
+            arr = np.asarray(data)
+            st.markdown(f"#### Data shape: `{arr.shape}`")
+
+            if arr.ndim == 2:
+                downsample = st.slider("Display downsample factor", 1, 20, 1, key="fits_2d_downsample")
+                img_data = arr[::downsample, ::downsample]
+                img, vmin, vmax = robust_image_scale(img_data)
+                fig = px.imshow(img, zmin=vmin, zmax=vmax, color_continuous_scale="Viridis", title="FITS image")
+                fig.update_layout(height=620, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#E5E7EB"))
+                st.plotly_chart(fig, use_container_width=True)
+
+            elif arr.ndim == 3:
+                axis = st.selectbox("Datacube slicing axis", [0, 1, 2], index=0)
+                max_slice = arr.shape[axis] - 1
+                slice_idx = st.slider("Slice index", 0, int(max_slice), int(max_slice // 2))
+                downsample = st.slider("Display downsample factor", 1, 20, 2, key="fits_cube_downsample")
+
+                if axis == 0:
+                    image = arr[slice_idx, ::downsample, ::downsample]
+                elif axis == 1:
+                    image = arr[::downsample, slice_idx, ::downsample]
+                else:
+                    image = arr[::downsample, ::downsample, slice_idx]
+
+                img, vmin, vmax = robust_image_scale(image)
+                fig = px.imshow(
+                    img,
+                    zmin=vmin,
+                    zmax=vmax,
+                    color_continuous_scale="Viridis",
+                    title=f"Datacube slice axis={axis}, index={slice_idx}",
+                )
+                fig.update_layout(height=620, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#E5E7EB"))
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("#### Quick spectrum extraction")
+                st.caption("Optimized for cubes where axis 0 is spectral/time-like and axes 1-2 are spatial.")
+
+                if arr.shape[1] > 1 and arr.shape[2] > 1:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        y_pix = st.number_input("Y pixel", min_value=0, max_value=int(arr.shape[1] - 1), value=int(arr.shape[1] // 2))
+                    with c2:
+                        x_pix = st.number_input("X pixel", min_value=0, max_value=int(arr.shape[2] - 1), value=int(arr.shape[2] // 2))
+
+                    spectrum = arr[:, int(y_pix), int(x_pix)]
+                    fig_spec = go.Figure(go.Scatter(y=spectrum, mode="lines"))
+                    fig_spec.update_layout(
+                        title="Extracted spectrum / cube profile",
+                        xaxis_title="Slice",
+                        yaxis_title="Value",
+                        height=320,
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#E5E7EB"),
+                    )
+                    st.plotly_chart(fig_spec, use_container_width=True)
+
+                st.warning(
+                    "This looks like an image/datacube FITS. AstroTrust-AI can visualize it, but the current classifier expects "
+                    "light-curve/alert-like data, not spectral datacubes."
+                )
+
+            else:
+                st.warning("This FITS data has dimensionality not yet supported by the viewer.")
+
+    except Exception as exc:
+        st.error(f"Could not open FITS file: {exc}")
+
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def read_uploaded_lightcurve_file(uploaded):
+    """Read CSV, Parquet, or FITS table uploaded by the user."""
+    suffix = Path(uploaded.name).suffix.lower()
+
+    if suffix == ".csv":
+        return pd.read_csv(uploaded), "csv"
+
+    if suffix == ".parquet":
+        return pd.read_parquet(uploaded), "parquet"
+
+    if suffix in [".fits", ".fit", ".fts"]:
+        if not HAS_ASTROPY:
+            raise RuntimeError("Astropy is required to read FITS files. Install with: pip install astropy")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded.read())
+            tmp_path = Path(tmp.name)
+
+        try:
+            return read_lightcurve_file_from_path(tmp_path)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def read_lightcurve_file_from_path(path):
+    """Read CSV, Parquet, or FITS table from a local path."""
+    path = Path(str(path).strip().strip('"'))
+    suffix = path.suffix.lower()
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    if suffix == ".csv":
+        return pd.read_csv(path), "csv_local"
+
+    if suffix == ".parquet":
+        return pd.read_parquet(path), "parquet_local"
+
+    if suffix in [".fits", ".fit", ".fts"]:
+        if not HAS_ASTROPY:
+            raise RuntimeError("Astropy is required to read FITS files. Install with: pip install astropy")
+
+        with fits.open(path, memmap=True) as hdul:
+            table_hdus = []
+            for idx, hdu in enumerate(hdul):
+                if getattr(hdu, "data", None) is not None and hasattr(hdu.data, "columns"):
+                    table_hdus.append((idx, hdu))
+
+            if not table_hdus:
+                raise ValueError(
+                    "No FITS table HDU was found. Image/datacube FITS files can be inspected in the Advanced Data Inspector, "
+                    "but they are not direct light-curve inputs."
+                )
+
+            selected_idx, selected_hdu = table_hdus[0]
+            for idx, hdu in table_hdus:
+                if str(hdu.name).upper() in ["PHOT", "PHOTOMETRY", "LIGHTCURVE", "LC"]:
+                    selected_idx, selected_hdu = idx, hdu
+                    break
+
+            table = pd.DataFrame(np.array(selected_hdu.data).byteswap().newbyteorder())
+            return table, f"fits_table_hdu_{selected_idx}_{selected_hdu.name}_local"
+
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def infer_lightcurve_columns(df: pd.DataFrame):
+    lower_map = {str(c).lower(): c for c in df.columns}
+
+    candidates = {
+        "object_id": ["object_id", "objectid", "objid", "diaobjectid", "snid", "id"],
+        "mjd": ["mjd", "time", "t", "jd", "date"],
+        "band": ["band", "filter", "passband", "fid"],
+        "flux": ["flux", "fluxcal", "flx", "psflux", "forcediffimflux"],
+        "flux_err": ["flux_err", "fluxerr", "flux_error", "fluxcalerr", "psfluxerr", "forcediffimfluxunc"],
+    }
+
+    inferred = {}
+    for target, names in candidates.items():
+        inferred[target] = None
+        for name in names:
+            if name.lower() in lower_map:
+                inferred[target] = lower_map[name.lower()]
+                break
+
+    return inferred
+
+
+def normalize_uploaded_lightcurve(df: pd.DataFrame, inferred: dict):
+    issues = []
+    required = ["mjd", "band", "flux"]
+    missing = [col for col in required if inferred.get(col) is None]
+
+    if missing:
+        issues.append(f"Missing required light-curve columns: {', '.join(missing)}")
+        return pd.DataFrame(), issues
+
+    out = pd.DataFrame()
+    if inferred.get("object_id") is not None:
+        out["object_id"] = df[inferred["object_id"]]
+    else:
+        out["object_id"] = 0
+        issues.append("No object_id column found; treating the file as a single object.")
+
+    out["mjd"] = pd.to_numeric(df[inferred["mjd"]], errors="coerce")
+    out["band"] = df[inferred["band"]].map(normalize_band)
+    out["flux"] = pd.to_numeric(df[inferred["flux"]], errors="coerce")
+
+    if inferred.get("flux_err") is not None:
+        out["flux_err"] = pd.to_numeric(df[inferred["flux_err"]], errors="coerce")
+    else:
+        out["flux_err"] = np.nan
+        issues.append("No flux uncertainty column found; plotting will work, but SNR/tensor construction will be incomplete.")
+
+    before = len(out)
+    out = out.dropna(subset=["mjd", "flux"])
+    dropped = before - len(out)
+    if dropped > 0:
+        issues.append(f"Dropped {dropped} rows with invalid mjd or flux values.")
+
+    return out, issues
+
+
+def plot_uploaded_lightcurve(lc: pd.DataFrame, title="Uploaded light curve"):
+    if lc.empty:
+        st.warning("No valid light-curve rows to plot.")
+        return
+
+    fig = go.Figure()
+    lc = lc.sort_values("mjd")
+
+    for band, group in lc.groupby("band"):
+        if "flux_err" in group.columns and group["flux_err"].notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=group["mjd"],
+                    y=group["flux"],
+                    error_y=dict(type="data", array=group["flux_err"], visible=True),
+                    mode="markers+lines",
+                    name=str(band),
+                )
+            )
+        else:
+            fig.add_trace(go.Scatter(x=group["mjd"], y=group["flux"], mode="markers+lines", name=str(band)))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="MJD / time",
+        yaxis_title="Flux",
+        height=520,
+        legend_title="Band",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,0.42)",
+        font=dict(color="#E5E7EB"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def show_upload_alert_lightcurve():
+    st.subheader("Upload Alert / Light Curve")
+    st.caption(
+        "Import a light-curve or alert-like table in CSV, Parquet, or FITS-table format. "
+        "For large local files, use local path mode instead of browser upload."
+    )
+
+    input_mode = st.radio(
+        "Input mode",
+        ["Browser upload", "Local file path"],
+        horizontal=True,
+        key="lightcurve_input_mode",
+    )
+
+    raw_df = None
+    source_type = None
+    source_label = None
+
+    if input_mode == "Browser upload":
+        uploaded = st.file_uploader(
+            "Upload light-curve table",
+            type=["csv", "parquet", "fits", "fit", "fts"],
+            help="Expected columns: object_id optional, mjd/time, band/filter/passband, flux, and optionally flux_err.",
+            key="lightcurve_upload",
+        )
+
+        if uploaded is None:
+            st.info("Upload a CSV, Parquet, or FITS table containing a light curve to begin.")
+            st.markdown(
+                """
+                **Expected minimum schema**
+
+                | Column role | Accepted examples |
+                |---|---|
+                | Time | `mjd`, `time`, `jd` |
+                | Band/filter | `band`, `filter`, `passband`, `fid` |
+                | Flux | `flux`, `fluxcal`, `forcediffimflux` |
+                | Flux uncertainty | `flux_err`, `fluxerr`, `fluxcalerr`, `forcediffimfluxunc` |
+                | Object identifier | `object_id`, `diaObjectId`, `SNID` |
+                """
+            )
+            return
+
+        try:
+            raw_df, source_type = read_uploaded_lightcurve_file(uploaded)
+            source_label = uploaded.name
+        except Exception as exc:
+            st.error(f"Could not read uploaded file: {exc}")
+            return
+
+    else:
+        local_file = interactive_local_file_picker(
+            label="Local light-curve path",
+            suffixes=[".csv", ".parquet", ".fits", ".fit", ".fts"],
+            default_dir=str(ROOT_DIR / "data" / "processed" / "elasticc2_large"),
+            key_prefix="lightcurve_local",
+        )
+
+        if local_file is None:
+            st.info("Browse a folder or paste a local path to a CSV, Parquet, or FITS table containing light-curve data.")
+            return
+
+        try:
+            raw_df, source_type = read_lightcurve_file_from_path(local_file)
+            source_label = str(local_file)
+        except Exception as exc:
+            st.error(f"Could not read local file: {exc}")
+            return
+
+    st.success(f"Loaded `{source_label}` as `{source_type}` with {len(raw_df):,} rows and {len(raw_df.columns):,} columns.")
+
+    with st.expander("Raw table preview", expanded=False):
+        st.dataframe(raw_df.head(500), use_container_width=True)
+
+    inferred = infer_lightcurve_columns(raw_df)
+    st.markdown("#### Column mapping")
+    mapping_df = pd.DataFrame([
+        {"role": role, "detected_column": col if col is not None else "—"}
+        for role, col in inferred.items()
+    ])
+    st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+
+    lc, issues = normalize_uploaded_lightcurve(raw_df, inferred)
+    if issues:
+        for issue in issues:
+            st.warning(issue)
+
+    if lc.empty:
+        st.error("The uploaded file could not be converted into a valid light curve.")
+        return
+
+    object_values = sorted(pd.Series(lc["object_id"]).dropna().unique().tolist())
+    if len(object_values) > 1:
+        selected_object = st.selectbox("Select object", object_values)
+        lc_obj = lc[lc["object_id"] == selected_object]
+    else:
+        selected_object = object_values[0]
+        lc_obj = lc
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Rows", len(lc_obj))
+    with c2:
+        st.metric("Bands", lc_obj["band"].nunique())
+    with c3:
+        safe_metric("Time span", float(lc_obj["mjd"].max() - lc_obj["mjd"].min()))
+    with c4:
+        st.metric("Object", str(selected_object))
+
+    plot_uploaded_lightcurve(lc_obj, title=f"Uploaded light curve: {selected_object}")
+
+    st.markdown("#### Prediction readiness")
+    checks = pd.DataFrame([
+        {"check": "Has time, band, and flux", "status": "OK" if all(inferred.get(c) is not None for c in ["mjd", "band", "flux"]) else "Missing"},
+        {"check": "Has flux uncertainty", "status": "OK" if inferred.get("flux_err") is not None else "Recommended"},
+        {"check": "At least 10 observations", "status": "OK" if len(lc_obj) >= 10 else "Low"},
+        {"check": "At least 2 bands", "status": "OK" if lc_obj["band"].nunique() >= 2 else "Low"},
+    ])
+    st.dataframe(checks, use_container_width=True, hide_index=True)
+
+    st.info(
+        "Next implementation step: connect this validated light curve to the tensor builder, v4 feature extractor, "
+        "hybrid model checkpoint, temperature scaling, novelty scoring, rarity scoring, and follow-up policy used in the experiments."
+    )
+
+
+def show_overview(assets):
+    perf = assets["performance"]
+    cal = assets["calibration"]
+    policy = assets["policy_summary"]
+
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>AstroTrust-AI</h1>
+            <p>Interactive decision-support dashboard for astronomical alert triage. Explore hybrid temporal-tabular classification, calibrated uncertainty, novelty, rarity, and follow-up ranking.</p>
+            <div class="chip-row">
+                <span class="chip">Hybrid temporal-tabular AI</span>
+                <span class="chip">Calibrated probabilities</span>
+                <span class="chip">Novelty + rarity follow-up</span>
+                <span class="chip">FITS viewer</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not perf.empty:
+        best = perf.sort_values("macro_f1", ascending=False).iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            safe_metric("Best Accuracy", best.get("accuracy"))
+        with c2:
+            safe_metric("Best Macro-F1", best.get("macro_f1"))
+        with c3:
+            safe_metric("Balanced Accuracy", best.get("balanced_accuracy"))
+        with c4:
+            safe_metric("Best model", best.get("model"))
+
+    c1, c2 = st.columns([1.25, 1])
+    with c1:
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.subheader("Model evolution")
+        plot_model_performance(perf)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.subheader("Calibration")
+        if not cal.empty:
+            temp_test = cal[cal["model"].astype(str).str.contains("temp_test", na=False)]
+            raw_test = cal[cal["model"].astype(str).str.contains("raw_test", na=False)]
+            c21, c22 = st.columns(2)
+            with c21:
+                safe_metric("Raw ECE", raw_test["ece"].iloc[0] if not raw_test.empty else None)
+            with c22:
+                safe_metric("Temp. ECE", temp_test["ece"].iloc[0] if not temp_test.empty else None)
+            plot_calibration(cal)
+        else:
+            st.info("Calibration file not found.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("Follow-up policy summary")
+    plot_policy_enrichment(policy)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def show_candidate_explorer(class_names):
+    st.subheader("Candidate Explorer")
+    st.caption("Filter and inspect candidates ranked for follow-up. Use this page as a broker-like triage view.")
+
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Candidate filters")
+        policy_label = st.selectbox("Follow-up policy", list(POLICY_FILES.keys()), index=0)
+        top_n = st.slider("Top N candidates", min_value=50, max_value=5000, value=500, step=50)
+
+    ranking = load_ranking(policy_label)
+    if ranking.empty:
+        st.error("Ranking data not found. Run app/prepare_dashboard_data.py first.")
+        return
+
+    ranking = add_class_names(ranking, class_names)
+    filtered = ranking.copy()
+
+    with st.sidebar:
+        if "predicted_class_name" in filtered.columns:
+            classes = ["All"] + sorted(filtered["predicted_class_name"].dropna().unique().tolist())
+            selected_class = st.selectbox("Predicted class", classes)
+            if selected_class != "All":
+                filtered = filtered[filtered["predicted_class_name"] == selected_class]
+
+        status = st.selectbox("Prediction status", ["All", "Correct only", "Errors only"])
+        if status == "Correct only" and "correct" in filtered.columns:
+            filtered = filtered[filtered["correct"] == True]
+        elif status == "Errors only" and "correct" in filtered.columns:
+            filtered = filtered[filtered["correct"] == False]
+
+        if "true_is_rare" in filtered.columns:
+            rare_filter = st.selectbox("True rarity", ["All", "Rare only", "Non-rare only"])
+            if rare_filter == "Rare only":
+                filtered = filtered[filtered["true_is_rare"] == True]
+            elif rare_filter == "Non-rare only":
+                filtered = filtered[filtered["true_is_rare"] == False]
+
+        for col, label in [
+            ("confidence", "Confidence"),
+            ("uncertainty_score", "Uncertainty"),
+            ("novelty_score", "Novelty"),
+            ("rarity_score", "Rarity"),
+        ]:
+            if col in filtered.columns and not filtered.empty:
+                min_v, max_v = float(filtered[col].min()), float(filtered[col].max())
+                if min_v < max_v:
+                    lo, hi = st.slider(label, min_value=min_v, max_value=max_v, value=(min_v, max_v))
+                    filtered = filtered[(filtered[col] >= lo) & (filtered[col] <= hi)]
+
+    filtered = filtered.sort_values("priority_score", ascending=False).head(top_n)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Candidates", len(filtered))
+    with c2:
+        safe_metric("Rare true rate", filtered["true_is_rare"].mean() if "true_is_rare" in filtered.columns and len(filtered) else None)
+    with c3:
+        safe_metric("Selection accuracy", filtered["correct"].mean() if "correct" in filtered.columns and len(filtered) else None)
+    with c4:
+        safe_metric("Mean priority", filtered["priority_score"].mean() if "priority_score" in filtered.columns and len(filtered) else None)
+
+    display_cols = [
+        "priority_rank", "object_id", "true_class_name", "predicted_class_name", "correct",
+        "confidence", "uncertainty_score", "novelty_score", "rarity_score", "priority_score",
+        "true_is_rare", "predicted_is_rare",
+    ]
+    display_cols = [c for c in display_cols if c in filtered.columns]
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.subheader("Inspect candidate")
+    if filtered.empty:
+        st.warning("No candidates match the filters.")
+        return
+
+    object_ids = filtered["object_id"].astype(int).tolist()
+    selected_object = st.selectbox("Select object_id", object_ids, index=0)
+    selected_row = filtered[filtered["object_id"].astype(int) == int(selected_object)].iloc[0]
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Object", int(selected_row["object_id"]))
+    with c2:
+        st.metric("Predicted", selected_row.get("predicted_class_name", "—"))
+    with c3:
+        st.metric("True", selected_row.get("true_class_name", "—"))
+    with c4:
+        status_text = "Correct" if bool(selected_row.get("correct", False)) else "Error"
+        st.metric("Status", status_text)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        safe_metric("Confidence", selected_row.get("confidence"))
+    with c2:
+        safe_metric("Uncertainty", selected_row.get("uncertainty_score"))
+    with c3:
+        safe_metric("Novelty", selected_row.get("novelty_score"))
+    with c4:
+        safe_metric("Rarity", selected_row.get("rarity_score"))
+
+    lc_path = CACHE_DIR / "dashboard_test_lightcurves.parquet"
+    if lc_path.exists():
+        lc = load_lightcurves(lc_path)
+        lc_object = lc[lc["object_id"].astype(int) == int(selected_object)]
+        plot_light_curve(lc_object)
+    else:
+        st.warning("Light-curve cache not found. Run: python .\\app\\prepare_dashboard_data.py")
+
+
+def show_broker_view(class_names):
+    st.subheader("Broker view")
+    st.caption("Operational view for top follow-up budgets. This is useful for simulating limited observing resources.")
+
+    policy_label = st.selectbox("Policy", list(POLICY_FILES.keys()), index=0, key="broker_policy")
+    ranking = load_ranking(policy_label)
+    if ranking.empty:
+        st.error("Ranking data not found.")
+        return
+    ranking = add_class_names(ranking, class_names)
+
+    budget = st.radio("Follow-up budget", ["Top 5%", "Top 10%", "Top 20%"], horizontal=True)
+    frac = {"Top 5%": 0.05, "Top 10%": 0.10, "Top 20%": 0.20}[budget]
+    k = max(1, int(np.ceil(len(ranking) * frac)))
+    top = ranking.sort_values("priority_score", ascending=False).head(k)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Selected", k)
+    with c2:
+        safe_metric("Rare rate", top["true_is_rare"].mean() if "true_is_rare" in top.columns else None)
+    with c3:
+        safe_metric("Accuracy", top["correct"].mean() if "correct" in top.columns else None)
+    with c4:
+        safe_metric("Mean priority", top["priority_score"].mean() if "priority_score" in top.columns else None)
+
+    if "predicted_class_name" in top.columns:
+        counts = top["predicted_class_name"].value_counts().reset_index()
+        counts.columns = ["predicted_class", "n"]
+        fig = px.bar(counts.head(20), x="n", y="predicted_class", orientation="h", title="Top selected candidates by predicted class")
+        fig.update_layout(height=520, yaxis_title="", xaxis_title="Count", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.42)", font=dict(color="#E5E7EB"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    display_cols = ["priority_rank", "object_id", "predicted_class_name", "true_class_name", "correct", "confidence", "novelty_score", "rarity_score", "priority_score", "true_is_rare"]
+    display_cols = [c for c in display_cols if c in top.columns]
+    st.dataframe(top[display_cols], use_container_width=True, hide_index=True)
+
+
+def main():
+    class_names = load_class_names()
+    assets = load_dashboard_assets() if CACHE_DIR.exists() else {}
+
+    with st.sidebar:
+        st.image("https://img.icons8.com/fluency/96/telescope.png", width=58)
+        st.title("AstroTrust-AI")
+        st.caption("Scientific alert triage dashboard")
+
+        if not CACHE_DIR.exists():
+            st.error("Dashboard cache not found.")
+            st.code("python .\\app\\prepare_dashboard_data.py")
+
+    tab_overview, tab_candidates, tab_broker, tab_upload, tab_fits = st.tabs([
+        "Overview",
+        "Candidate Explorer",
+        "Broker View",
+        "Upload Alert / Light Curve",
+        "Advanced Data Inspector",
+    ])
+
+    with tab_overview:
+        if not CACHE_DIR.exists():
+            st.error("Dashboard cache not found. Run: python .\\app\\prepare_dashboard_data.py")
+        else:
+            show_overview(assets)
+
+    with tab_candidates:
+        if not CACHE_DIR.exists():
+            st.error("Dashboard cache not found. Run: python .\\app\\prepare_dashboard_data.py")
+        else:
+            show_candidate_explorer(class_names)
+
+    with tab_broker:
+        if not CACHE_DIR.exists():
+            st.error("Dashboard cache not found. Run: python .\\app\\prepare_dashboard_data.py")
+        else:
+            show_broker_view(class_names)
+
+    with tab_upload:
+        show_upload_alert_lightcurve()
+
+    with tab_fits:
+        show_fits_viewer()
+
+
+if __name__ == "__main__":
+    main()
