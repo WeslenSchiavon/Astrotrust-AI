@@ -1,4 +1,22 @@
 from pathlib import Path
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from snana_elasticc_utils import (
+        load_snana_pair_from_uploads,
+        load_snana_pair_from_paths,
+    )
+    from astrotrust_inference import get_inference_engine
+    HAS_SNANA_UTILS = True
+    SNANA_UTILS_IMPORT_ERROR = None
+except Exception as exc:
+    HAS_SNANA_UTILS = False
+    SNANA_UTILS_IMPORT_ERROR = exc
+
+from pathlib import Path
 import tempfile
 
 import numpy as np
@@ -643,7 +661,9 @@ def show_fits_viewer():
 
             if hasattr(data, "columns"):
                 max_rows = st.slider("Rows to preview", 50, 5000, 500, step=50, key="fits_table_preview_rows")
-                table_df = pd.DataFrame(np.array(data[:max_rows]).byteswap().newbyteorder())
+                arr = np.array(data[:max_rows])
+                arr = arr.byteswap().view(arr.dtype.newbyteorder())
+                table_df = pd.DataFrame(arr)
                 st.markdown("#### FITS table preview")
                 st.dataframe(table_df, use_container_width=True)
                 st.info(
@@ -793,7 +813,10 @@ def read_lightcurve_file_from_path(path):
                     selected_idx, selected_hdu = idx, hdu
                     break
 
-            table = pd.DataFrame(np.array(selected_hdu.data).byteswap().newbyteorder())
+            arr = np.array(selected_hdu.data)
+            arr = arr.byteswap().view(arr.dtype.newbyteorder())
+            table = pd.DataFrame(arr)
+
             return table, f"fits_table_hdu_{selected_idx}_{selected_hdu.name}_local"
 
     raise ValueError(f"Unsupported file type: {suffix}")
@@ -805,7 +828,7 @@ def infer_lightcurve_columns(df: pd.DataFrame):
     candidates = {
         "object_id": ["object_id", "objectid", "objid", "diaobjectid", "snid", "id"],
         "mjd": ["mjd", "time", "t", "jd", "date"],
-        "band": ["band", "filter", "passband", "fid"],
+        "band": ["band", "filter", "passband", "fid", "flt"],
         "flux": ["flux", "fluxcal", "flx", "psflux", "forcediffimflux"],
         "flux_err": ["flux_err", "fluxerr", "flux_error", "fluxcalerr", "psfluxerr", "forcediffimfluxunc"],
     }
@@ -891,12 +914,322 @@ def plot_uploaded_lightcurve(lc: pd.DataFrame, title="Uploaded light curve"):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def show_snana_elasticc_pair_upload():
+    st.markdown("### SNANA / ELAsTiCC HEAD + PHOT pair")
+    st.caption(
+        "Use this mode for ELAsTiCC/SNANA FITS files where HEAD stores object metadata "
+        "and PHOT stores the photometric observations."
+    )
+
+    if not HAS_SNANA_UTILS:
+        st.error(f"SNANA/ELAsTiCC utilities could not be loaded: {SNANA_UTILS_IMPORT_ERROR}")
+        return
+
+    input_mode = st.radio(
+        "Input mode",
+        ["Browser upload", "Local file path"],
+        horizontal=True,
+        key="snana_pair_input_mode",
+    )
+
+    max_objects = st.number_input(
+        "Maximum objects to reconstruct",
+        min_value=1,
+        max_value=100000,
+        value=1000,
+        step=100,
+        help="Use a smaller value for quick testing. Increase later if needed.",
+    )
+
+    try:
+        if input_mode == "Browser upload":
+            c1, c2 = st.columns(2)
+
+            with c1:
+                head_upload = st.file_uploader(
+                    "Upload HEAD.FITS",
+                    type=["fits", "fit", "fts"],
+                    key="snana_head_upload",
+                )
+
+            with c2:
+                phot_upload = st.file_uploader(
+                    "Upload PHOT.FITS",
+                    type=["fits", "fit", "fts"],
+                    key="snana_phot_upload",
+                )
+
+            if head_upload is None or phot_upload is None:
+                st.info("Upload both HEAD.FITS and PHOT.FITS to reconstruct light curves.")
+                return
+
+            with st.spinner("Reading HEAD + PHOT and reconstructing light curves..."):
+                lc, meta, head_df, phot_df = load_snana_pair_from_uploads(
+                    head_upload,
+                    phot_upload,
+                    max_objects=max_objects,
+                )
+
+        else:
+            c1, c2 = st.columns(2)
+
+            with c1:
+                head_path = interactive_local_file_picker(
+                    label="Local HEAD.FITS path",
+                    suffixes=[".fits", ".fit", ".fts"],
+                    default_dir=str(Path.home()),
+                    key_prefix="snana_head_local",
+                )
+
+            with c2:
+                phot_path = interactive_local_file_picker(
+                    label="Local PHOT.FITS path",
+                    suffixes=[".fits", ".fit", ".fts"],
+                    default_dir=str(Path.home()),
+                    key_prefix="snana_phot_local",
+                )
+
+            if head_path is None or phot_path is None:
+                st.info("Select both HEAD.FITS and PHOT.FITS.")
+                return
+
+            with st.spinner("Reading HEAD + PHOT and reconstructing light curves..."):
+                lc, meta, head_df, phot_df = load_snana_pair_from_paths(
+                    head_path,
+                    phot_path,
+                    max_objects=max_objects,
+                )
+
+    except Exception as exc:
+        st.error(f"Could not reconstruct SNANA/ELAsTiCC light curves: {exc}")
+        return
+
+    st.success(
+        f"Reconstructed {meta['n_output_objects']:,} objects and "
+        f"{meta['n_output_rows']:,} photometric rows."
+    )
+
+    with st.expander("Detected SNANA/ELAsTiCC metadata", expanded=False):
+        st.json(meta)
+
+    with st.expander("HEAD preview", expanded=False):
+        st.dataframe(head_df.head(50), use_container_width=True)
+
+    with st.expander("PHOT preview", expanded=False):
+        st.dataframe(phot_df.head(50), use_container_width=True)
+
+    object_values = sorted(pd.Series(lc["object_id"]).dropna().unique().tolist())
+
+    if len(object_values) == 0:
+        st.error("No object_id/SNID values were reconstructed.")
+        return
+
+    selected_object = st.selectbox(
+        "Select SNID / object_id",
+        object_values,
+        key="snana_selected_object",
+    )
+
+    lc_obj = lc[lc["object_id"] == selected_object].copy()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric("Observations", len(lc_obj))
+    with c2:
+        st.metric("Bands", lc_obj["band"].nunique())
+    with c3:
+        safe_metric("Time span", float(lc_obj["mjd"].max() - lc_obj["mjd"].min()))
+    with c4:
+        st.metric("SNID", str(selected_object))
+
+    plot_uploaded_lightcurve(lc_obj, title=f"SNANA/ELAsTiCC light curve: {selected_object}")
+
+    st.markdown("#### Prediction readiness")
+
+    checks = pd.DataFrame([
+        {"check": "HEAD + PHOT joined", "status": "OK"},
+        {"check": "Has MJD, band, flux", "status": "OK"},
+        {"check": "Has flux uncertainty", "status": "OK" if lc_obj["flux_err"].notna().any() else "Recommended"},
+        {"check": "At least 10 observations", "status": "OK" if len(lc_obj) >= 10 else "Low"},
+        {"check": "At least 2 bands", "status": "OK" if lc_obj["band"].nunique() >= 2 else "Low"},
+    ])
+
+    st.dataframe(checks, use_container_width=True, hide_index=True)
+
+    render_prediction_panel(lc_obj, selected_object)
+
+
+def render_prediction_panel(lc_obj, selected_object):
+    st.markdown("#### AstroTrust-AI prediction")
+
+    if not HAS_ASTROTRUST_INFERENCE:
+        st.error(f"Inference module could not be loaded: {ASTROTRUST_INFERENCE_IMPORT_ERROR}")
+        return
+
+    prediction_mode = st.radio(
+        "Prediction mode",
+        [
+            "Diagnostic preview: light curve only + zero tabular features",
+            "Full hybrid inference: light curve + uploaded v4 tabular features",
+        ],
+        horizontal=False,
+        key=f"prediction_mode_{selected_object}",
+    )
+
+    tabular_features = None
+    allow_zero_tabular = False
+
+    if prediction_mode.startswith("Diagnostic"):
+        allow_zero_tabular = True
+        st.warning(
+            "Diagnostic mode uses the uploaded light curve but fills the 319 tabular/context features with zeros. "
+            "This tests the interface, but it is not the full scientific model used in the experiments."
+        )
+
+    else:
+        st.info(
+            "For full hybrid inference, upload a CSV/Parquet/FITS table containing the v4 tabular feature row "
+            "for the same object."
+        )
+
+        tab_upload = st.file_uploader(
+            "Upload v4 tabular feature row",
+            type=["csv", "parquet", "fits", "fit", "fts"],
+            key=f"tabular_features_{selected_object}",
+        )
+
+        if tab_upload is not None:
+            try:
+                tab_df, tab_source = read_uploaded_lightcurve_file(tab_upload)
+
+                st.success(
+                    f"Loaded tabular features as {tab_source}: "
+                    f"{len(tab_df):,} rows and {len(tab_df.columns):,} columns."
+                )
+
+                if "object_id" in tab_df.columns:
+                    matches = tab_df[tab_df["object_id"].astype(str) == str(selected_object)]
+
+                    if not matches.empty:
+                        tabular_features = matches.iloc[[0]].copy()
+                        st.info(f"Matched tabular feature row by object_id = {selected_object}.")
+                    else:
+                        tabular_features = tab_df.iloc[[0]].copy()
+                        st.warning("No matching object_id found. Using the first row.")
+                else:
+                    tabular_features = tab_df.iloc[[0]].copy()
+                    st.warning("No object_id column found. Using the first row.")
+
+                tabular_features = tabular_features.drop(
+                    columns=[c for c in ["object_id", "label"] if c in tabular_features.columns],
+                    errors="ignore",
+                )
+
+            except Exception as exc:
+                st.error(f"Could not load tabular feature file: {exc}")
+                tabular_features = None
+
+        if tabular_features is None:
+            st.warning("Full hybrid prediction requires a valid v4 tabular feature row.")
+
+    run_prediction = st.button(
+        "Predict with AstroTrust-AI",
+        type="primary",
+        use_container_width=True,
+        key=f"predict_button_{selected_object}",
+    )
+
+    if not run_prediction:
+        return
+
+    if prediction_mode.startswith("Full") and tabular_features is None:
+        st.error("Please upload a valid v4 tabular feature row or switch to diagnostic preview mode.")
+        return
+
+    try:
+        with st.spinner("Running AstroTrust-AI inference..."):
+            engine = get_inference_engine()
+
+            result = engine.predict_from_lightcurve(
+                lightcurve_df=lc_obj,
+                tabular_features=tabular_features,
+                allow_zero_tabular=allow_zero_tabular,
+            )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            st.metric("Predicted class", result["predicted_class_name"])
+        with c2:
+            st.metric("Confidence", f"{result['confidence']:.4f}")
+        with c3:
+            st.metric("Priority score", f"{result['priority_score']:.4f}")
+        with c4:
+            st.metric("Rare prediction", "Yes" if result["is_predicted_rare"] else "No")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric("Uncertainty", f"{result['uncertainty_score']:.4f}")
+        with c2:
+            st.metric("Novelty", f"{result['novelty_score']:.4f}")
+        with c3:
+            st.metric("Rarity", f"{result['rarity_score']:.4f}")
+
+        if result.get("used_zero_tabular_preview"):
+            st.warning(
+                "This result used zero-filled tabular/context features. "
+                "Use full hybrid inference with v4 tabular features for scientific results."
+            )
+
+        top_classes = pd.DataFrame(result["top_classes"])
+
+        st.markdown("#### Top-5 predicted classes")
+        st.dataframe(top_classes, use_container_width=True, hide_index=True)
+
+        fig = px.bar(
+            top_classes.sort_values("probability", ascending=True),
+            x="probability",
+            y="class_name",
+            orientation="h",
+            title="Top-5 class probabilities",
+        )
+
+        fig.update_layout(
+            height=320,
+            yaxis_title="",
+            xaxis_title="Probability",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.42)",
+            font=dict(color="#E5E7EB"),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as exc:
+        st.error(f"Prediction failed: {exc}")
+
 def show_upload_alert_lightcurve():
     st.subheader("Upload Alert / Light Curve")
     st.caption(
         "Import a light-curve or alert-like table in CSV, Parquet, or FITS-table format. "
         "For large local files, use local path mode instead of browser upload."
     )
+
+    input_format = st.radio(
+        "Input format",
+        [
+            "Generic light-curve table",
+            "SNANA / ELAsTiCC HEAD + PHOT pair",
+        ],
+        horizontal=True,
+        key="upload_input_format",
+    )
+
+    if input_format == "SNANA / ELAsTiCC HEAD + PHOT pair":
+        show_snana_elasticc_pair_upload()
+        return
 
     input_mode = st.radio(
         "Input mode",
@@ -983,9 +1316,16 @@ def show_upload_alert_lightcurve():
         return
 
     object_values = sorted(pd.Series(lc["object_id"]).dropna().unique().tolist())
-    if len(object_values) > 1:
+
+    if len(object_values) == 0:
+        selected_object = "single_object"
+        lc["object_id"] = selected_object
+        lc_obj = lc
+
+    elif len(object_values) > 1:
         selected_object = st.selectbox("Select object", object_values)
         lc_obj = lc[lc["object_id"] == selected_object]
+
     else:
         selected_object = object_values[0]
         lc_obj = lc
@@ -1011,10 +1351,165 @@ def show_upload_alert_lightcurve():
     ])
     st.dataframe(checks, use_container_width=True, hide_index=True)
 
-    st.info(
-        "Next implementation step: connect this validated light curve to the tensor builder, v4 feature extractor, "
-        "hybrid model checkpoint, temperature scaling, novelty scoring, rarity scoring, and follow-up policy used in the experiments."
+
+    st.markdown("#### AstroTrust-AI prediction")
+
+    if not HAS_ASTROTRUST_INFERENCE:
+        st.error(f"Inference module could not be loaded: {ASTROTRUST_INFERENCE_IMPORT_ERROR}")
+        return
+
+    prediction_mode = st.radio(
+        "Prediction mode",
+        [
+            "Diagnostic preview: light curve only + zero tabular features",
+            "Full hybrid inference: light curve + uploaded v4 tabular features",
+        ],
+        horizontal=False,
     )
+
+    tabular_features = None
+    allow_zero_tabular = False
+
+    if prediction_mode.startswith("Diagnostic"):
+        allow_zero_tabular = True
+        st.warning(
+            "Diagnostic mode uses the uploaded light curve but fills the 319 tabular/context features with zeros. "
+            "This is useful to test the interface, but it is not the full scientific model used in the experiments."
+        )
+
+    else:
+        st.info(
+            "For full hybrid inference, upload a CSV/Parquet/FITS table containing the v4 tabular feature row "
+            "for the same object. If the file has multiple rows and an object_id column, the interface will try to match it."
+        )
+
+        tabular_upload = st.file_uploader(
+            "Upload v4 tabular feature row",
+            type=["csv", "parquet", "fits", "fit", "fts"],
+            key="uploaded_tabular_features_for_prediction",
+        )
+
+        if tabular_upload is not None:
+            try:
+                tab_df, tab_source = read_uploaded_lightcurve_file(tabular_upload)
+
+                st.success(
+                    f"Loaded tabular feature file as {tab_source}: "
+                    f"{len(tab_df):,} rows and {len(tab_df.columns):,} columns."
+                )
+
+                with st.expander("Tabular feature preview", expanded=False):
+                    st.dataframe(tab_df.head(20), use_container_width=True)
+
+                if "object_id" in tab_df.columns:
+                    matches = tab_df[tab_df["object_id"].astype(str) == str(selected_object)]
+
+                    if not matches.empty:
+                        tabular_features = matches.iloc[[0]].copy()
+                        st.info(f"Matched tabular feature row by object_id = {selected_object}.")
+                    else:
+                        tabular_features = tab_df.iloc[[0]].copy()
+                        st.warning("No matching object_id found. Using the first row.")
+                else:
+                    tabular_features = tab_df.iloc[[0]].copy()
+                    st.warning("No object_id column found in tabular feature file. Using the first row.")
+
+                tabular_features = tabular_features.drop(
+                    columns=[c for c in ["object_id", "label"] if c in tabular_features.columns],
+                    errors="ignore",
+                )
+
+            except Exception as exc:
+                st.error(f"Could not load tabular feature file: {exc}")
+                tabular_features = None
+
+        if tabular_features is None:
+            st.warning("Full hybrid prediction requires a valid v4 tabular feature row.")
+
+    run_prediction = st.button(
+        "Predict with AstroTrust-AI",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if run_prediction:
+        if prediction_mode.startswith("Full") and tabular_features is None:
+            st.error("Please upload a valid v4 tabular feature row or switch to diagnostic preview mode.")
+            return
+
+        try:
+            with st.spinner("Running AstroTrust-AI inference..."):
+                engine = get_inference_engine()
+
+                result = engine.predict_from_lightcurve(
+                    lightcurve_df=lc_obj,
+                    tabular_features=tabular_features,
+                    allow_zero_tabular=allow_zero_tabular,
+                )
+
+            st.markdown("#### Prediction result")
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            with c1:
+                st.metric("Predicted class", result["predicted_class_name"])
+            with c2:
+                st.metric("Confidence", f"{result['confidence']:.4f}")
+            with c3:
+                st.metric("Priority score", f"{result['priority_score']:.4f}")
+            with c4:
+                st.metric("Rare prediction", "Yes" if result["is_predicted_rare"] else "No")
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                st.metric("Uncertainty", f"{result['uncertainty_score']:.4f}")
+            with c2:
+                st.metric("Novelty", f"{result['novelty_score']:.4f}")
+            with c3:
+                st.metric("Rarity", f"{result['rarity_score']:.4f}")
+
+            if result.get("used_zero_tabular_preview"):
+                st.warning(
+                    "This result used zero-filled tabular/context features. "
+                    "Use full hybrid inference with v4 tabular features for scientific results."
+                )
+
+            missing = result.get("missing_tabular_features", [])
+
+            if missing:
+                with st.expander(f"Missing tabular features filled with zero ({len(missing)})", expanded=False):
+                    st.write(missing[:200])
+
+                    if len(missing) > 200:
+                        st.caption(f"Showing first 200 of {len(missing)} missing features.")
+
+            top_classes = pd.DataFrame(result["top_classes"])
+
+            st.markdown("#### Top-5 predicted classes")
+            st.dataframe(top_classes, use_container_width=True, hide_index=True)
+
+            fig = px.bar(
+                top_classes.sort_values("probability", ascending=True),
+                x="probability",
+                y="class_name",
+                orientation="h",
+                title="Top-5 class probabilities",
+            )
+
+            fig.update_layout(
+                height=320,
+                yaxis_title="",
+                xaxis_title="Probability",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(15,23,42,0.42)",
+                font=dict(color="#E5E7EB"),
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as exc:
+            st.error(f"Prediction failed: {exc}")
 
 
 def show_overview(assets):
