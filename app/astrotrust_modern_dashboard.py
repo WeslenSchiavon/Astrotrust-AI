@@ -9,12 +9,19 @@ try:
         load_snana_pair_from_uploads,
         load_snana_pair_from_paths,
     )
-    from astrotrust_inference import get_inference_engine
     HAS_SNANA_UTILS = True
     SNANA_UTILS_IMPORT_ERROR = None
 except Exception as exc:
     HAS_SNANA_UTILS = False
     SNANA_UTILS_IMPORT_ERROR = exc
+
+try:
+    from astrotrust_inference import get_inference_engine
+    HAS_ASTROTRUST_INFERENCE = True
+    ASTROTRUST_INFERENCE_IMPORT_ERROR = None
+except Exception as exc:
+    HAS_ASTROTRUST_INFERENCE = False
+    ASTROTRUST_INFERENCE_IMPORT_ERROR = exc
 
 try:
     from astrotrust_feature_builder import build_v4_feature_row_auto
@@ -1066,10 +1073,21 @@ def show_snana_elasticc_pair_upload():
 
     st.dataframe(checks, use_container_width=True, hide_index=True)
 
-    render_prediction_panel(lc_obj, selected_object)
+    head_row = None
+
+    for candidate_col in ["SNID", "object_id", "OBJECT_ID", "DIAOBJECTID", "diaObjectId"]:
+        if candidate_col in head_df.columns:
+            matches = head_df[
+                head_df[candidate_col].astype(str).str.strip() == str(selected_object).strip()
+            ]
+
+            if not matches.empty:
+                head_row = matches.iloc[0]
+                break
+    render_prediction_panel(lc_obj, selected_object, head_row=head_row)
 
 
-def render_prediction_panel(lc_obj, selected_object):
+def render_prediction_panel(lc_obj, selected_object, head_row=None):
     st.markdown("#### AstroTrust-AI prediction")
 
     if not HAS_SNANA_UTILS:
@@ -1188,7 +1206,7 @@ def render_prediction_panel(lc_obj, selected_object):
             if use_auto_builder:
                 tabular_features, auto_feature_report = build_v4_feature_row_auto(
                     lc_obj=lc_obj,
-                    head_row=None,
+                    head_row=head_row,
                     expected_columns=engine.tabular_columns,
                 )
                 allow_zero_tabular = False
@@ -1423,166 +1441,8 @@ def show_upload_alert_lightcurve():
     ])
     st.dataframe(checks, use_container_width=True, hide_index=True)
 
-
-    st.markdown("#### AstroTrust-AI prediction")
-
-    if not HAS_SNANA_UTILS:
-        st.error(f"Inference module could not be loaded: {SNANA_UTILS_IMPORT_ERROR}")
-        return
-
-    prediction_mode = st.radio(
-        "Prediction mode",
-        [
-            "Diagnostic preview: light curve only + zero tabular features",
-            "Full hybrid inference: light curve + uploaded v4 tabular features",
-        ],
-        horizontal=False,
-    )
-
-    tabular_features = None
-    allow_zero_tabular = False
-
-    if prediction_mode.startswith("Diagnostic"):
-        allow_zero_tabular = True
-        st.warning(
-            "Diagnostic mode uses the uploaded light curve but fills the 319 tabular/context features with zeros. "
-            "This is useful to test the interface, but it is not the full scientific model used in the experiments."
-        )
-
-    else:
-        st.info(
-            "For full hybrid inference, upload a CSV/Parquet/FITS table containing the v4 tabular feature row "
-            "for the same object. If the file has multiple rows and an object_id column, the interface will try to match it."
-        )
-
-        tabular_upload = st.file_uploader(
-            "Upload v4 tabular feature row",
-            type=["csv", "parquet", "fits", "fit", "fts"],
-            key="uploaded_tabular_features_for_prediction",
-        )
-
-        if tabular_upload is not None:
-            try:
-                tab_df, tab_source = read_uploaded_lightcurve_file(tabular_upload)
-
-                st.success(
-                    f"Loaded tabular feature file as {tab_source}: "
-                    f"{len(tab_df):,} rows and {len(tab_df.columns):,} columns."
-                )
-
-                with st.expander("Tabular feature preview", expanded=False):
-                    st.dataframe(tab_df.head(20), use_container_width=True)
-
-                if "object_id" in tab_df.columns:
-                    matches = tab_df[tab_df["object_id"].astype(str) == str(selected_object)]
-
-                    if not matches.empty:
-                        tabular_features = matches.iloc[[0]].copy()
-                        st.info(f"Matched tabular feature row by object_id = {selected_object}.")
-                    else:
-                        tabular_features = tab_df.iloc[[0]].copy()
-                        st.warning("No matching object_id found. Using the first row.")
-                else:
-                    tabular_features = tab_df.iloc[[0]].copy()
-                    st.warning("No object_id column found in tabular feature file. Using the first row.")
-
-                tabular_features = tabular_features.drop(
-                    columns=[c for c in ["object_id", "label"] if c in tabular_features.columns],
-                    errors="ignore",
-                )
-
-            except Exception as exc:
-                st.error(f"Could not load tabular feature file: {exc}")
-                tabular_features = None
-
-        if tabular_features is None:
-            st.warning("Full hybrid prediction requires a valid v4 tabular feature row.")
-
-    run_prediction = st.button(
-        "Predict with AstroTrust-AI",
-        type="primary",
-        use_container_width=True,
-    )
-
-    if run_prediction:
-        if prediction_mode.startswith("Full") and tabular_features is None:
-            st.error("Please upload a valid v4 tabular feature row or switch to diagnostic preview mode.")
-            return
-
-        try:
-            with st.spinner("Running AstroTrust-AI inference..."):
-                engine = get_inference_engine()
-
-                result = engine.predict_from_lightcurve(
-                    lightcurve_df=lc_obj,
-                    tabular_features=tabular_features,
-                    allow_zero_tabular=allow_zero_tabular,
-                )
-
-            st.markdown("#### Prediction result")
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            with c1:
-                st.metric("Predicted class", result["predicted_class_name"])
-            with c2:
-                st.metric("Confidence", f"{result['confidence']:.4f}")
-            with c3:
-                st.metric("Priority score", f"{result['priority_score']:.4f}")
-            with c4:
-                st.metric("Rare prediction", "Yes" if result["is_predicted_rare"] else "No")
-
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                st.metric("Uncertainty", f"{result['uncertainty_score']:.4f}")
-            with c2:
-                st.metric("Novelty", f"{result['novelty_score']:.4f}")
-            with c3:
-                st.metric("Rarity", f"{result['rarity_score']:.4f}")
-
-            if result.get("used_zero_tabular_preview"):
-                st.warning(
-                    "This result used zero-filled tabular/context features. "
-                    "Use full hybrid inference with v4 tabular features for scientific results."
-                )
-
-            missing = result.get("missing_tabular_features", [])
-
-            if missing:
-                with st.expander(f"Missing tabular features filled with zero ({len(missing)})", expanded=False):
-                    st.write(missing[:200])
-
-                    if len(missing) > 200:
-                        st.caption(f"Showing first 200 of {len(missing)} missing features.")
-
-            top_classes = pd.DataFrame(result["top_classes"])
-
-            st.markdown("#### Top-5 predicted classes")
-            st.dataframe(top_classes, use_container_width=True, hide_index=True)
-
-            fig = px.bar(
-                top_classes.sort_values("probability", ascending=True),
-                x="probability",
-                y="class_name",
-                orientation="h",
-                title="Top-5 class probabilities",
-            )
-
-            fig.update_layout(
-                height=320,
-                yaxis_title="",
-                xaxis_title="Probability",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(15,23,42,0.42)",
-                font=dict(color="#E5E7EB"),
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-        except Exception as exc:
-            st.error(f"Prediction failed: {exc}")
-
+    render_prediction_panel(lc_obj, selected_object)
+    return
 
 def show_overview(assets):
     perf = assets["performance"]
