@@ -16,6 +16,15 @@ except Exception as exc:
     HAS_SNANA_UTILS = False
     SNANA_UTILS_IMPORT_ERROR = exc
 
+try:
+    from astrotrust_feature_builder import build_v4_feature_row_auto
+    HAS_FEATURE_BUILDER = True
+    FEATURE_BUILDER_IMPORT_ERROR = None
+except Exception as exc:
+    HAS_FEATURE_BUILDER = False
+    FEATURE_BUILDER_IMPORT_ERROR = exc
+
+
 from pathlib import Path
 import tempfile
 
@@ -1063,13 +1072,15 @@ def show_snana_elasticc_pair_upload():
 def render_prediction_panel(lc_obj, selected_object):
     st.markdown("#### AstroTrust-AI prediction")
 
-    if not HAS_ASTROTRUST_INFERENCE:
-        st.error(f"Inference module could not be loaded: {ASTROTRUST_INFERENCE_IMPORT_ERROR}")
+    if not HAS_SNANA_UTILS:
+        st.error(f"Inference module could not be loaded: {SNANA_UTILS_IMPORT_ERROR}")
         return
 
     prediction_mode = st.radio(
         "Prediction mode",
         [
+            "Full hybrid inference: auto-build v4 features from light curve",
+            "Full hybrid inference: auto-match precomputed v4 features by object_id",
             "Diagnostic preview: light curve only + zero tabular features",
             "Full hybrid inference: light curve + uploaded v4 tabular features",
         ],
@@ -1079,8 +1090,28 @@ def render_prediction_panel(lc_obj, selected_object):
 
     tabular_features = None
     allow_zero_tabular = False
+    use_auto_builder = prediction_mode.startswith("Full hybrid inference: auto-build")
+    use_precomputed_features = prediction_mode.startswith("Full hybrid inference: auto-match")
+    auto_feature_report = None
 
-    if prediction_mode.startswith("Diagnostic"):
+    if use_auto_builder:
+        if not HAS_FEATURE_BUILDER:
+            st.error(f"Automatic feature builder could not be loaded: {FEATURE_BUILDER_IMPORT_ERROR}")
+            return
+
+        st.info(
+            "This mode automatically builds the tabular v4 feature vector from the selected light curve "
+            "and available HEAD metadata. Features that require unavailable external context are filled with zero."
+        )
+
+    elif use_precomputed_features:
+        st.info(
+            "This mode tries to match the selected SNID/object_id with "
+            "features_v4_temporal_shape_250000obj.parquet. If a match is found, "
+            "the prediction uses the full hybrid model."
+        )
+
+    elif prediction_mode.startswith("Diagnostic"):
         allow_zero_tabular = True
         st.warning(
             "Diagnostic mode uses the uploaded light curve but fills the 319 tabular/context features with zeros. "
@@ -1143,13 +1174,36 @@ def render_prediction_panel(lc_obj, selected_object):
     if not run_prediction:
         return
 
-    if prediction_mode.startswith("Full") and tabular_features is None:
+    if (
+        prediction_mode.startswith("Full hybrid inference: light curve + uploaded")
+        and tabular_features is None
+    ):
         st.error("Please upload a valid v4 tabular feature row or switch to diagnostic preview mode.")
         return
 
     try:
         with st.spinner("Running AstroTrust-AI inference..."):
             engine = get_inference_engine()
+
+            if use_auto_builder:
+                tabular_features, auto_feature_report = build_v4_feature_row_auto(
+                    lc_obj=lc_obj,
+                    head_row=None,
+                    expected_columns=engine.tabular_columns,
+                )
+                allow_zero_tabular = False
+
+            elif use_precomputed_features:
+                tabular_features = engine.get_precomputed_tabular_features(selected_object)
+
+                if tabular_features is None:
+                    st.error(
+                        f"No precomputed v4 tabular features found for object_id/SNID = {selected_object}. "
+                        "Use auto-build mode or diagnostic preview."
+                    )
+                    return
+
+                allow_zero_tabular = False
 
             result = engine.predict_from_lightcurve(
                 lightcurve_df=lc_obj,
@@ -1177,6 +1231,24 @@ def render_prediction_panel(lc_obj, selected_object):
         with c3:
             st.metric("Rarity", f"{result['rarity_score']:.4f}")
 
+        if auto_feature_report is not None:
+            st.info(
+                f"Auto-built v4 features: "
+                f"{auto_feature_report['n_matched_features']} matched, "
+                f"{auto_feature_report['n_missing_filled_zero']} filled with zero "
+                f"out of {auto_feature_report['n_expected_features']} expected features."
+            )
+
+            with st.expander("Automatic feature builder report", expanded=False):
+                st.json({
+                    "mode": auto_feature_report["mode"],
+                    "warning": auto_feature_report["warning"],
+                    "n_expected_features": auto_feature_report["n_expected_features"],
+                    "n_matched_features": auto_feature_report["n_matched_features"],
+                    "n_missing_filled_zero": auto_feature_report["n_missing_filled_zero"],
+                    "matched_features_preview": auto_feature_report["matched_features"][:100],
+                    "missing_features_preview": auto_feature_report["missing_features"][:100],
+                })
         if result.get("used_zero_tabular_preview"):
             st.warning(
                 "This result used zero-filled tabular/context features. "
@@ -1354,8 +1426,8 @@ def show_upload_alert_lightcurve():
 
     st.markdown("#### AstroTrust-AI prediction")
 
-    if not HAS_ASTROTRUST_INFERENCE:
-        st.error(f"Inference module could not be loaded: {ASTROTRUST_INFERENCE_IMPORT_ERROR}")
+    if not HAS_SNANA_UTILS:
+        st.error(f"Inference module could not be loaded: {SNANA_UTILS_IMPORT_ERROR}")
         return
 
     prediction_mode = st.radio(

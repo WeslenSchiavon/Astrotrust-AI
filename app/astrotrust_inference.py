@@ -10,6 +10,13 @@ import torch.nn as nn
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = ROOT_DIR / "results" / "hybrid_inference_artifacts_250k"
+PRECOMPUTED_V4_FEATURES_PATH = (
+    ROOT_DIR
+    / "data"
+    / "processed"
+    / "elasticc2_large"
+    / "features_v4_temporal_shape_250000obj.parquet"
+)
 
 BANDS = ["u", "g", "r", "i", "z", "Y"]
 BAND_TO_IDX = {b: i for i, b in enumerate(BANDS)}
@@ -273,11 +280,56 @@ class AstroTrustInferenceEngine:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
+        self._precomputed_features = None
+
     def _load_json(self, filename: str):
         path = self.artifact_dir / filename
         if not path.exists():
             raise FileNotFoundError(path)
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def load_precomputed_v4_features(self) -> pd.DataFrame:
+        """Load precomputed v4 tabular/context features for known ELAsTiCC objects.
+
+        This enables full hybrid inference for objects that are already present in the
+        processed AstroTrust-AI feature table. For truly new external alerts, a full
+        feature-extraction pipeline is still required.
+        """
+        if self._precomputed_features is not None:
+            return self._precomputed_features
+
+        if not PRECOMPUTED_V4_FEATURES_PATH.exists():
+            raise FileNotFoundError(PRECOMPUTED_V4_FEATURES_PATH)
+
+        df = pd.read_parquet(PRECOMPUTED_V4_FEATURES_PATH)
+
+        if "object_id" not in df.columns:
+            raise ValueError(f"Precomputed feature file does not contain object_id: {PRECOMPUTED_V4_FEATURES_PATH}")
+
+        df = df.copy()
+        df["_object_id_key"] = df["object_id"].astype(str).str.strip()
+        df = df.drop_duplicates("_object_id_key").set_index("_object_id_key", drop=False)
+
+        self._precomputed_features = df
+        return self._precomputed_features
+
+    def get_precomputed_tabular_features(self, object_id) -> pd.DataFrame | None:
+        """Return one v4 feature row matched by object_id/SNID, or None if not found."""
+        df = self.load_precomputed_v4_features()
+        key = str(object_id).strip()
+
+        if key in df.index:
+            return df.loc[[key]].copy()
+
+        # Fallback for IDs represented as float-like strings, e.g. '10044575.0'.
+        try:
+            key_int = str(int(float(key)))
+            if key_int in df.index:
+                return df.loc[[key_int]].copy()
+        except Exception:
+            pass
+
+        return None
 
     def build_tabular_vector(self, tabular_features: dict | pd.Series | pd.DataFrame | None, allow_zero_tabular: bool = False):
         if tabular_features is None:
