@@ -554,11 +554,78 @@ def _compute_lightcurve_feature_pool(lc_obj: pd.DataFrame, head_row: pd.Series |
                     features[key_str.lower()] = value_num
             except Exception:
                 continue
+    
+    # Derive only host-galaxy/contextual features whose base values were provided.
+    zphot = features.get("hostgal_zphot", None)
+    zphot_err = features.get("hostgal_zphot_err", None)
 
-    # Extinction placeholders.
-    # For real scientific use, these should later come from a dust map query.
-    features.setdefault("mwebv", 0.0)
-    features.setdefault("mwebv_err", 0.0)
+    if (
+        zphot is not None
+        and zphot_err is not None
+        and np.isfinite(zphot)
+        and np.isfinite(zphot_err)
+    ):
+        zphot = float(zphot)
+        zphot_err = float(abs(zphot_err))
+
+        features["hostgal_zphot_relative_err"] = (
+            zphot_err / max(abs(zphot), EPS)
+        )
+
+    # Derive photo-z interval widths only if the quantile columns exist in the user/context file.
+    if "hostgal_zphot_q100" in features and "hostgal_zphot_q000" in features:
+        features["hostgal_zphot_q100_q000_width"] = (
+            features["hostgal_zphot_q100"] - features["hostgal_zphot_q000"]
+        )
+
+    if "hostgal_zphot_q090" in features and "hostgal_zphot_q010" in features:
+        features["hostgal_zphot_q090_q010_width"] = (
+            features["hostgal_zphot_q090"] - features["hostgal_zphot_q010"]
+        )
+
+    if "hostgal_zphot_q080" in features and "hostgal_zphot_q020" in features:
+        features["hostgal_zphot_q080_q020_width"] = (
+            features["hostgal_zphot_q080"] - features["hostgal_zphot_q020"]
+        )
+
+    # Derive host colors only if host magnitudes were provided.
+    host_color_pairs = [
+        ("u", "g"),
+        ("g", "r"),
+        ("r", "i"),
+        ("i", "z"),
+        ("z", "y"),
+        ("g", "i"),
+        ("r", "z"),
+    ]
+
+    for b1, b2 in host_color_pairs:
+        m1 = features.get(f"hostgal_mag_{b1}", None)
+        m2 = features.get(f"hostgal_mag_{b2}", None)
+
+        if (
+            m1 is not None
+            and m2 is not None
+            and np.isfinite(m1)
+            and np.isfinite(m2)
+        ):
+            features[f"hostgal_color_{b1}_{b2}"] = float(m1 - m2)
+
+    # Derive angular separation only if transient and host coordinates were provided.
+    if all(k in features for k in ["ra", "dec", "ra_host", "dec_host"]):
+        ra1 = np.deg2rad(features["ra"])
+        dec1 = np.deg2rad(features["dec"])
+        ra2 = np.deg2rad(features["ra_host"])
+        dec2 = np.deg2rad(features["dec_host"])
+
+        cos_sep = (
+            np.sin(dec1) * np.sin(dec2)
+            + np.cos(dec1) * np.cos(dec2) * np.cos(ra1 - ra2)
+        )
+        cos_sep = np.clip(cos_sep, -1.0, 1.0)
+        sep_rad = np.arccos(cos_sep)
+
+        features["hostgal_snsep"] = float(np.rad2deg(sep_rad) * 3600.0)
     
     return features
 
@@ -710,7 +777,15 @@ def build_v4_feature_row_auto(
             values[col] = 0.0
 
     df = pd.DataFrame([values], columns=expected_columns)
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Robust sanitation before scaler/model inference.
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.fillna(0.0)
+
+    # Avoid float32 overflow or extreme values that can break sklearn/torch.
+    df = df.clip(lower=-1e10, upper=1e10)
+    df = df.astype(np.float32)
 
     feature_coverage_rows = []
 

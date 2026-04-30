@@ -374,7 +374,13 @@ def normalize_lightcurve_table(
     out = pd.DataFrame(index=raw_df.index)
 
     if inferred.get("object_id") is not None:
-        out["object_id"] = raw_df[inferred["object_id"]].astype(str)
+        obj = raw_df[inferred["object_id"]]
+
+        if obj.notna().any():
+            out["object_id"] = obj.astype(str)
+        else:
+            out["object_id"] = "single_object"
+            warnings.append("object_id column exists but is empty. Treating the file as a single object.")
     else:
         out["object_id"] = "single_object"
         warnings.append("No object_id column found; treating the file as a single object.")
@@ -404,6 +410,21 @@ def normalize_lightcurve_table(
         out["flux"] = flux
         out["flux_err"] = flux_err
         out["mag"] = mag
+
+        # Common real-survey placeholder for invalid/non-detection magnitudes.
+        invalid_mag = (
+            (~np.isfinite(out["mag"]))
+            | (out["mag"] >= 90)
+        )
+
+        if "mag_err" in out.columns:
+            invalid_mag = invalid_mag | (~np.isfinite(out["mag_err"])) | (out["mag_err"] >= 90)
+
+        if invalid_mag.any():
+            warnings.append(
+                f"Removed {int(invalid_mag.sum())} rows with invalid magnitude placeholders, e.g. mag/mag_err >= 90."
+            )
+            out = out[~invalid_mag].copy()
 
         if mag_err is not None:
             out["mag_err"] = mag_err

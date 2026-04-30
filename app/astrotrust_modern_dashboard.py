@@ -1255,7 +1255,12 @@ def compute_prediction_reliability(
     source_domain="generic",
     prediction_result=None,
 ):
-    """Compute a user-facing reliability flag for the current prediction."""
+    """Separate input quality from model-domain reliability.
+
+    Input quality describes whether the uploaded light curve is technically useful.
+    Model-domain reliability describes whether the trained model should be trusted
+    for this source domain and feature coverage.
+    """
     n_obs = len(lc_obj)
     n_bands = lc_obj["band"].nunique() if "band" in lc_obj.columns else 0
 
@@ -1264,56 +1269,144 @@ def compute_prediction_reliability(
     else:
         time_span = 0.0
 
-    reasons = []
-    score = 3
+    has_flux_err = (
+        "flux_err" in lc_obj.columns
+        and lc_obj["flux_err"].notna().any()
+    )
+
+    # ----------------------------
+    # 1. Input quality
+    # ----------------------------
+    input_score = 3
+    input_reasons = []
 
     if n_obs < 10:
-        score = min(score, 1)
-        reasons.append("Very few observations.")
+        input_score = min(input_score, 1)
+        input_reasons.append("Very few observations.")
     elif n_obs < 30:
-        score = min(score, 2)
-        reasons.append("Limited number of observations.")
+        input_score = min(input_score, 2)
+        input_reasons.append("Limited number of observations.")
 
-    if n_bands < 2:
-        score = min(score, 2)
-        reasons.append("Single-band input. The model was trained mostly for multiband light curves.")
+    if n_bands < 1:
+        input_score = min(input_score, 1)
+        input_reasons.append("No valid photometric band detected.")
+    elif n_bands == 1:
+        input_score = min(input_score, 2)
+        input_reasons.append("Single-band input; multiband coverage is preferable.")
 
     if time_span <= 0:
-        score = min(score, 1)
-        reasons.append("Invalid or zero time span.")
+        input_score = min(input_score, 1)
+        input_reasons.append("Invalid or zero time span.")
 
-    if source_domain in ["generic", "generic_magnitude", "ztf_irsa", "fits_table"]:
-        score = min(score, 2)
-        reasons.append(
-            f"{source_domain} input may be out-of-domain relative to the ELAsTiCC/LSST-like training data."
-        )
+    if not has_flux_err:
+        input_score = min(input_score, 2)
+        input_reasons.append("No valid flux uncertainty available.")
+
+    if input_score >= 3:
+        input_level = "Good"
+    elif input_score == 2:
+        input_level = "Limited"
+    else:
+        input_level = "Low"
+
+    if not input_reasons:
+        input_reasons.append("Input has enough observations, valid time coverage, and usable photometric uncertainty.")
+
+    # ----------------------------
+    # 2. Feature completeness
+    # ----------------------------
+    feature_info = {
+        "n_expected_features": None,
+        "n_matched_features": None,
+        "n_missing_filled_zero": None,
+        "matched_fraction": None,
+        "level": "Unknown",
+        "reasons": [],
+    }
+
+    missing_frac = None
 
     if auto_feature_report is not None:
         n_expected = auto_feature_report.get("n_expected_features", 0)
+        n_matched = auto_feature_report.get("n_matched_features", 0)
         n_missing = auto_feature_report.get("n_missing_filled_zero", 0)
 
         if n_expected > 0:
+            matched_fraction = n_matched / n_expected
             missing_frac = n_missing / n_expected
 
-            if missing_frac > 0.50:
-                score = min(score, 2)
-                reasons.append(
-                    f"Many tabular/context features were auto-filled with zero ({n_missing}/{n_expected})."
-                )
+            if matched_fraction >= 0.85:
+                feature_level = "Good"
+            elif matched_fraction >= 0.60:
+                feature_level = "Limited"
+            else:
+                feature_level = "Low"
 
-            elif missing_frac > 0.25:
-                score = min(score, 2)
-                reasons.append(
-                    f"Some tabular/context features were auto-filled with zero ({n_missing}/{n_expected})."
-                )
+            feature_reasons = [
+                f"{n_matched}/{n_expected} features were available or derived.",
+                f"{n_missing}/{n_expected} features were filled with zero as model-compatible placeholders.",
+            ]
+
+            feature_info = {
+                "n_expected_features": int(n_expected),
+                "n_matched_features": int(n_matched),
+                "n_missing_filled_zero": int(n_missing),
+                "matched_fraction": float(matched_fraction),
+                "level": feature_level,
+                "reasons": feature_reasons,
+            }
+
+    # ----------------------------
+    # 3. Model-domain reliability
+    # ----------------------------
+    domain_score = 3
+    domain_reasons = []
+
+    in_domain_sources = ["snana_elasticc", "snana_like_table", "elasticc", "lsst_like"]
+    external_sources = ["generic", "generic_magnitude", "ztf_irsa", "fits_table"]
+
+    if source_domain in external_sources:
+        domain_score = min(domain_score, 2)
+        domain_reasons.append(
+            f"{source_domain} input may be out-of-domain relative to the ELAsTiCC/LSST-like training data."
+        )
+
+    elif source_domain in in_domain_sources:
+        domain_reasons.append(
+            f"{source_domain} is compatible with the main ELAsTiCC/LSST-like training domain."
+        )
+
+    else:
+        domain_score = min(domain_score, 2)
+        domain_reasons.append(
+            f"Unknown source domain: {source_domain}."
+        )
+
+    if n_bands == 1:
+        domain_score = min(domain_score, 2)
+        domain_reasons.append(
+            "Single-band input limits the reliability of a model trained with multiband light curves."
+        )
+
+    if missing_frac is not None:
+        if missing_frac > 0.50:
+            domain_score = min(domain_score, 1)
+            domain_reasons.append(
+                f"More than half of the expected features were filled with zero ({missing_frac:.1%})."
+            )
+        elif missing_frac > 0.25:
+            domain_score = min(domain_score, 2)
+            domain_reasons.append(
+                f"Some expected features were filled with zero ({missing_frac:.1%})."
+            )
 
     if prediction_result is not None:
         novelty_score = prediction_result.get("novelty_score", None)
         confidence = prediction_result.get("confidence", None)
 
         if novelty_score is not None and novelty_score >= 0.90:
-            score = 1
-            reasons.append(
+            domain_score = 1
+            domain_reasons.append(
                 f"Extreme novelty score ({novelty_score:.3f}); the object is highly out-of-distribution."
             )
 
@@ -1323,26 +1416,43 @@ def compute_prediction_reliability(
             and novelty_score is not None
             and novelty_score >= 0.90
         ):
-            reasons.append(
-                "High confidence combined with extreme novelty can indicate overconfident out-of-domain prediction."
+            domain_reasons.append(
+                "High confidence combined with extreme novelty may indicate overconfident out-of-domain prediction."
             )
 
-    if score >= 3:
-        level = "Good"
-    elif score == 2:
-        level = "Limited"
+    if domain_score >= 3:
+        domain_level = "Good"
+    elif domain_score == 2:
+        domain_level = "Limited"
     else:
-        level = "Low"
+        domain_level = "Low"
 
-    if not reasons:
-        reasons.append("Input has enough observations, multiple bands, and no major reliability warning.")
+    if not domain_reasons:
+        domain_reasons.append("No major model-domain reliability warning detected.")
 
     return {
-        "level": level,
-        "n_obs": n_obs,
-        "n_bands": n_bands,
-        "time_span": time_span,
-        "reasons": reasons,
+        # Backward-compatible fields used by the report exporter.
+        "level": domain_level,
+        "reasons": domain_reasons,
+        "n_obs": int(n_obs),
+        "n_bands": int(n_bands),
+        "time_span": float(time_span),
+
+        # New explicit structure.
+        "input_quality": {
+            "level": input_level,
+            "n_obs": int(n_obs),
+            "n_bands": int(n_bands),
+            "time_span": float(time_span),
+            "has_flux_uncertainty": bool(has_flux_err),
+            "reasons": input_reasons,
+        },
+        "feature_completeness": feature_info,
+        "model_domain_reliability": {
+            "level": domain_level,
+            "source_domain": source_domain,
+            "reasons": domain_reasons,
+        },
     }
 
 
@@ -1359,37 +1469,84 @@ def display_prediction_reliability(
         prediction_result=prediction_result,
     )
 
-    st.markdown("#### Prediction reliability")
+    input_quality = reliability["input_quality"]
+    feature_completeness = reliability["feature_completeness"]
+    model_domain = reliability["model_domain_reliability"]
 
-    level = reliability["level"]
-
-    if level == "Good":
-        st.success("Prediction reliability: Good")
-    elif level == "Limited":
-        st.warning("Prediction reliability: Limited")
-    else:
-        st.error("Prediction reliability: Low")
+    st.markdown("#### Scientific reliability assessment")
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.metric("Reliability", level)
+        level = input_quality["level"]
+        if level == "Good":
+            st.success(f"Input quality: {level}")
+        elif level == "Limited":
+            st.warning(f"Input quality: {level}")
+        else:
+            st.error(f"Input quality: {level}")
+
     with c2:
-        st.metric("Bands", reliability["n_bands"])
+        level = feature_completeness["level"]
+        if level == "Good":
+            st.success(f"Feature completeness: {level}")
+        elif level == "Limited":
+            st.warning(f"Feature completeness: {level}")
+        elif level == "Low":
+            st.error(f"Feature completeness: {level}")
+        else:
+            st.info(f"Feature completeness: {level}")
+
     with c3:
-        safe_metric("Time span", reliability["time_span"])
+        level = model_domain["level"]
+        if level == "Good":
+            st.success(f"Model-domain reliability: {level}")
+        elif level == "Limited":
+            st.warning(f"Model-domain reliability: {level}")
+        else:
+            st.error(f"Model-domain reliability: {level}")
 
-    reason_df = pd.DataFrame(
-        [{"reason": reason} for reason in reliability["reasons"]]
-    )
+    m1, m2, m3, m4 = st.columns(4)
 
+    with m1:
+        st.metric("Observations", input_quality["n_obs"])
+    with m2:
+        st.metric("Bands", input_quality["n_bands"])
+    with m3:
+        safe_metric("Time span", input_quality["time_span"])
+    with m4:
+        st.metric("Source domain", source_domain)
+
+    if feature_completeness["matched_fraction"] is not None:
+        m1, m2, m3 = st.columns(3)
+
+        with m1:
+            st.metric("Matched features", feature_completeness["n_matched_features"])
+        with m2:
+            st.metric("Missing / filled zero", feature_completeness["n_missing_filled_zero"])
+        with m3:
+            safe_metric("Matched fraction", feature_completeness["matched_fraction"])
+
+    rows = []
+
+    for reason in input_quality["reasons"]:
+        rows.append({"category": "Input quality", "reason": reason})
+
+    for reason in feature_completeness.get("reasons", []):
+        rows.append({"category": "Feature completeness", "reason": reason})
+
+    for reason in model_domain["reasons"]:
+        rows.append({"category": "Model-domain reliability", "reason": reason})
+
+    reason_df = pd.DataFrame(rows)
     st.dataframe(reason_df, use_container_width=True, hide_index=True)
 
-    if source_domain in ["generic", "generic_magnitude", "ztf_irsa", "fits_table"]:
+    if model_domain["level"] in ["Limited", "Low"]:
         st.info(
-            "This is a real/generic light-curve input. Treat the result as triage support, "
-            "not as a final scientific classification without follow-up validation."
+            "Use this prediction as scientific triage support, not as a final classification, "
+            "unless the source domain and validation conditions are compatible with the trained model."
         )
+
 
 def show_snana_elasticc_pair_upload():
     st.markdown("### SNANA / ELAsTiCC HEAD + PHOT pair")
@@ -1669,6 +1826,11 @@ def build_prediction_export_report(
                 "Use as triage support, not as a final scientific classification, "
                 "when reliability is Limited or Low."
             ),
+            "feature_policy": (
+                "AstroTrust-AI does not invent astrophysical contextual values. "
+                "Unavailable host/context features are filled with zero only as model-compatible placeholders "
+                "and are explicitly reported as missing_filled_zero."
+            ),
             "notes": [
                 "High confidence combined with high novelty may indicate an overconfident out-of-domain prediction.",
                 "Generic real-survey inputs may differ from the ELAsTiCC/LSST-like training domain.",
@@ -1766,19 +1928,38 @@ def render_prediction_export_buttons(
 def merge_metadata_rows(base_row=None, extra_row=None):
     merged = {}
 
-    if base_row is not None:
-        if isinstance(base_row, pd.Series):
-            merged.update(base_row.to_dict())
-        elif isinstance(base_row, dict):
-            merged.update(base_row)
+    def add_values(row):
+        if row is None:
+            return
 
-    if extra_row is not None:
-        if isinstance(extra_row, pd.Series):
-            merged.update(extra_row.to_dict())
-        elif isinstance(extra_row, dict):
-            merged.update(extra_row)
+        if isinstance(row, pd.Series):
+            row = row.to_dict()
+
+        if not isinstance(row, dict):
+            return
+
+        for key, value in row.items():
+            try:
+                value = float(value)
+
+                if not np.isfinite(value):
+                    continue
+
+                # Evita valores absurdos que quebram float32/scaler/modelo.
+                if abs(value) > 1e10:
+                    continue
+
+                merged[str(key)] = value
+
+            except Exception:
+                # Ignora texto/categorias não numéricas no contexto.
+                continue
+
+    add_values(base_row)
+    add_values(extra_row)
 
     return merged if merged else None
+
 
 
 def read_context_metadata_file(uploaded_file):
@@ -1793,9 +1974,15 @@ def read_context_metadata_file(uploaded_file):
     raise ValueError("Unsupported context metadata file. Use CSV or Parquet.")
 
 
+
 def select_context_row(context_df: pd.DataFrame, selected_object):
     if context_df.empty:
-        return None, "Context table is empty."
+        return None, "Context table is empty. No context row was used."
+
+    selected_object_str = str(selected_object).strip()
+
+    if selected_object_str.lower() in ["nan", "none", ""]:
+        return None, "Selected object_id is invalid or missing. No context row was used."
 
     object_candidates = [
         "object_id",
@@ -1816,20 +2003,62 @@ def select_context_row(context_df: pd.DataFrame, selected_object):
             break
 
     if object_col is not None:
-        matches = context_df[
-            context_df[object_col].astype(str).str.strip()
-            == str(selected_object).strip()
+        valid_context = context_df[context_df[object_col].notna()].copy()
+
+        matches = valid_context[
+            valid_context[object_col].astype(str).str.strip()
+            == selected_object_str
         ]
 
         if not matches.empty:
-            return matches.iloc[0], f"Matched context row by {object_col} = {selected_object}."
+            return matches.iloc[0], f"Matched context row by {object_col} = {selected_object_str}."
 
-        return context_df.iloc[0], (
-            f"No matching context row found for object_id = {selected_object}. "
-            "Using the first row."
+        return None, (
+            f"No matching context row found for object_id = {selected_object_str}. "
+            "No context metadata was used."
         )
 
-    return context_df.iloc[0], "No object_id column found in context table. Using the first row."
+    return None, "No object_id column found in context table. No context metadata was used."
+
+
+def build_host_context_template(selected_object):
+    columns = [
+        "object_id",
+        "ra",
+        "dec",
+        "ra_host",
+        "dec_host",
+        "hostgal_zphot",
+        "hostgal_zphot_err",
+        "hostgal_zphot_q000",
+        "hostgal_zphot_q010",
+        "hostgal_zphot_q020",
+        "hostgal_zphot_q080",
+        "hostgal_zphot_q090",
+        "hostgal_zphot_q100",
+        "hostgal_mag_u",
+        "hostgal_mag_g",
+        "hostgal_mag_r",
+        "hostgal_mag_i",
+        "hostgal_mag_z",
+        "hostgal_mag_y",
+        "hostgal_magerr_u",
+        "hostgal_magerr_g",
+        "hostgal_magerr_r",
+        "hostgal_magerr_i",
+        "hostgal_magerr_z",
+        "hostgal_magerr_y",
+        "hostgal_ellipticity",
+        "hostgal_sqradius",
+        "mwebv",
+        "mwebv_err",
+    ]
+
+    row = {col: "" for col in columns}
+    row["object_id"] = str(selected_object)
+
+    return pd.DataFrame([row])
+
 
 def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domain="generic"):
     st.markdown("#### AstroTrust-AI prediction")
@@ -1860,6 +2089,18 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
             "such as hostgal_zphot, hostgal_zphot_err, hostgal_mag_g, hostgal_color_g_r, hostgal_snsep."
         )
 
+        template_df = build_host_context_template(selected_object)
+
+        st.download_button(
+            "Download host/context template CSV",
+            data=template_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"astrotrust_host_context_template_{make_safe_filename(selected_object)}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"download_context_template_{make_safe_filename(selected_object)}",
+            on_click="ignore",
+        )
+
         context_upload = st.file_uploader(
             "Upload host/context metadata table",
             type=["csv", "parquet"],
@@ -1883,7 +2124,10 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
                     selected_object,
                 )
 
-                st.info(context_message)
+                if extra_context_row is None:
+                    st.warning(context_message)
+                else:
+                    st.success(context_message)
 
             except Exception as exc:
                 st.error(f"Could not read context metadata table: {exc}")

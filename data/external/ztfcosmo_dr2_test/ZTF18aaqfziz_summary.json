@@ -1,0 +1,13 @@
+{
+  "target_name": "ZTF18aaqfziz",
+  "lightcurve_csv": "C:\\Users\\wesle\\Desktop\\Astrolara\\MeuProjeto\\astrotrust-ai\\data\\external\\ztfcosmo_dr2_test\\ZTF18aaqfziz_lightcurve.csv",
+  "raw_lightcurve_csv": "C:\\Users\\wesle\\Desktop\\Astrolara\\MeuProjeto\\astrotrust-ai\\data\\external\\ztfcosmo_dr2_test\\ZTF18aaqfziz_lightcurve_raw.csv",
+  "context_csv": "C:\\Users\\wesle\\Desktop\\Astrolara\\MeuProjeto\\astrotrust-ai\\data\\external\\ztfcosmo_dr2_test\\ZTF18aaqfziz_host_context.csv",
+  "n_rows": 1212,
+  "n_bands": 3,
+  "bands": [
+    "g",
+    "i",
+    "r"
+  ]
+}
