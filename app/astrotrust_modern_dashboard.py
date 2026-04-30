@@ -1,8 +1,22 @@
 from pathlib import Path
+import json
 import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from astrotrust_data_adapter import (
+        read_and_normalize_from_uploaded,
+        read_and_normalize_from_path,
+        read_and_normalize_from_url,
+        summarize_objects as adapter_summarize_objects,
+    )
+    HAS_DATA_ADAPTER = True
+    DATA_ADAPTER_IMPORT_ERROR = None
+except Exception as exc:
+    HAS_DATA_ADAPTER = False
+    DATA_ADAPTER_IMPORT_ERROR = exc
 
 try:
     from snana_elasticc_utils import (
@@ -1268,10 +1282,10 @@ def compute_prediction_reliability(
         score = min(score, 1)
         reasons.append("Invalid or zero time span.")
 
-    if source_domain == "generic":
+    if source_domain in ["generic", "generic_magnitude", "ztf_irsa", "fits_table"]:
         score = min(score, 2)
         reasons.append(
-            "Generic real-survey input may be out-of-domain relative to the ELAsTiCC/LSST-like training data."
+            f"{source_domain} input may be out-of-domain relative to the ELAsTiCC/LSST-like training data."
         )
 
     if auto_feature_report is not None:
@@ -1371,7 +1385,7 @@ def display_prediction_reliability(
 
     st.dataframe(reason_df, use_container_width=True, hide_index=True)
 
-    if source_domain == "generic":
+    if source_domain in ["generic", "generic_magnitude", "ztf_irsa", "fits_table"]:
         st.info(
             "This is a real/generic light-curve input. Treat the result as triage support, "
             "not as a final scientific classification without follow-up validation."
@@ -1552,6 +1566,271 @@ def show_snana_elasticc_pair_upload():
     )
 
 
+
+def make_safe_filename(value):
+    text = str(value)
+    safe = "".join(c if c.isalnum() or c in ["-", "_"] else "_" for c in text)
+    return safe[:120]
+
+
+def json_safe(value):
+    """Convert NumPy/Pandas objects to JSON-safe Python objects."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+
+    if isinstance(value, tuple):
+        return [json_safe(v) for v in value]
+
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict(orient="records")
+
+    if isinstance(value, pd.Series):
+        return value.to_dict()
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        if np.isnan(value) or np.isinf(value):
+            return None
+        return float(value)
+
+    if isinstance(value, float):
+        if np.isnan(value) or np.isinf(value):
+            return None
+        return value
+
+    if value is pd.NA:
+        return None
+
+    return value
+
+
+def build_prediction_export_report(
+    selected_object,
+    source_domain,
+    lc_obj,
+    prediction_result,
+    reliability,
+    auto_feature_report=None,
+):
+    """Build a structured scientific report for one AstroTrust-AI prediction."""
+
+    top_classes = prediction_result.get("top_classes", [])
+
+    feature_summary = None
+
+    if auto_feature_report is not None:
+        feature_summary = {
+            "mode": auto_feature_report.get("mode"),
+            "warning": auto_feature_report.get("warning"),
+            "n_expected_features": auto_feature_report.get("n_expected_features"),
+            "n_matched_features": auto_feature_report.get("n_matched_features"),
+            "n_missing_filled_zero": auto_feature_report.get("n_missing_filled_zero"),
+            "matched_by_category": auto_feature_report.get("matched_by_category", {}),
+            "missing_by_category": auto_feature_report.get("missing_by_category", {}),
+            "missing_features": auto_feature_report.get("missing_features", []),
+        }
+
+    report = {
+        "object_id": str(selected_object),
+        "source_domain": source_domain,
+        "input_summary": {
+            "n_rows": int(len(lc_obj)),
+            "n_bands": int(lc_obj["band"].nunique()) if "band" in lc_obj.columns else None,
+            "mjd_min": float(lc_obj["mjd"].min()) if "mjd" in lc_obj.columns and len(lc_obj) else None,
+            "mjd_max": float(lc_obj["mjd"].max()) if "mjd" in lc_obj.columns and len(lc_obj) else None,
+            "time_span": float(lc_obj["mjd"].max() - lc_obj["mjd"].min())
+            if "mjd" in lc_obj.columns and len(lc_obj)
+            else None,
+            "bands": sorted(lc_obj["band"].astype(str).unique().tolist()) if "band" in lc_obj.columns else [],
+        },
+        "prediction": {
+            "predicted_label": prediction_result.get("predicted_label"),
+            "predicted_class_name": prediction_result.get("predicted_class_name"),
+            "confidence": prediction_result.get("confidence"),
+            "uncertainty_score": prediction_result.get("uncertainty_score"),
+            "novelty_score": prediction_result.get("novelty_score"),
+            "rarity_score": prediction_result.get("rarity_score"),
+            "priority_score": prediction_result.get("priority_score"),
+            "is_predicted_rare": prediction_result.get("is_predicted_rare"),
+        },
+        "top_classes": top_classes,
+        "reliability": reliability,
+        "feature_builder": feature_summary,
+        "scientific_interpretation": {
+            "recommended_use": (
+                "Use as triage support, not as a final scientific classification, "
+                "when reliability is Limited or Low."
+            ),
+            "notes": [
+                "High confidence combined with high novelty may indicate an overconfident out-of-domain prediction.",
+                "Generic real-survey inputs may differ from the ELAsTiCC/LSST-like training domain.",
+                "Missing host-galaxy/redshift features can reduce scientific reliability.",
+            ],
+        },
+    }
+
+    return json_safe(report)
+
+
+def render_prediction_export_buttons(
+    selected_object,
+    source_domain,
+    lc_obj,
+    prediction_result,
+    reliability,
+    auto_feature_report=None,
+):
+    safe_id = make_safe_filename(selected_object)
+
+    report = build_prediction_export_report(
+        selected_object=selected_object,
+        source_domain=source_domain,
+        lc_obj=lc_obj,
+        prediction_result=prediction_result,
+        reliability=reliability,
+        auto_feature_report=auto_feature_report,
+    )
+
+    st.markdown("#### Export prediction report")
+
+    json_text = json.dumps(report, indent=2, ensure_ascii=False)
+
+    summary_row = {
+        "object_id": report["object_id"],
+        "source_domain": report["source_domain"],
+        "predicted_class": report["prediction"]["predicted_class_name"],
+        "confidence": report["prediction"]["confidence"],
+        "uncertainty": report["prediction"]["uncertainty_score"],
+        "novelty": report["prediction"]["novelty_score"],
+        "rarity": report["prediction"]["rarity_score"],
+        "priority_score": report["prediction"]["priority_score"],
+        "is_predicted_rare": report["prediction"]["is_predicted_rare"],
+        "reliability": report["reliability"]["level"],
+        "n_rows": report["input_summary"]["n_rows"],
+        "n_bands": report["input_summary"]["n_bands"],
+        "time_span": report["input_summary"]["time_span"],
+    }
+
+    if report.get("feature_builder") is not None:
+        summary_row["n_expected_features"] = report["feature_builder"]["n_expected_features"]
+        summary_row["n_matched_features"] = report["feature_builder"]["n_matched_features"]
+        summary_row["n_missing_filled_zero"] = report["feature_builder"]["n_missing_filled_zero"]
+
+    summary_df = pd.DataFrame([summary_row])
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.download_button(
+            "Download report JSON",
+            data=json_text.encode("utf-8"),
+            file_name=f"astrotrust_prediction_report_{safe_id}.json",
+            mime="application/json",
+            use_container_width=True,
+            key=f"download_report_json_{safe_id}",
+            on_click="ignore",
+        )
+
+    with c2:
+        st.download_button(
+            "Download summary CSV",
+            data=summary_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"astrotrust_prediction_summary_{safe_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"download_summary_csv_{safe_id}",
+            on_click="ignore",
+        )
+
+    with c3:
+        export_lc = lc_obj.copy()
+        st.download_button(
+            "Download normalized light curve",
+            data=export_lc.to_csv(index=False).encode("utf-8"),
+            file_name=f"astrotrust_normalized_lightcurve_{safe_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"download_normalized_lc_{safe_id}",
+            on_click="ignore",
+        )
+
+
+def merge_metadata_rows(base_row=None, extra_row=None):
+    merged = {}
+
+    if base_row is not None:
+        if isinstance(base_row, pd.Series):
+            merged.update(base_row.to_dict())
+        elif isinstance(base_row, dict):
+            merged.update(base_row)
+
+    if extra_row is not None:
+        if isinstance(extra_row, pd.Series):
+            merged.update(extra_row.to_dict())
+        elif isinstance(extra_row, dict):
+            merged.update(extra_row)
+
+    return merged if merged else None
+
+
+def read_context_metadata_file(uploaded_file):
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+
+    if suffix == ".parquet":
+        return pd.read_parquet(uploaded_file)
+
+    raise ValueError("Unsupported context metadata file. Use CSV or Parquet.")
+
+
+def select_context_row(context_df: pd.DataFrame, selected_object):
+    if context_df.empty:
+        return None, "Context table is empty."
+
+    object_candidates = [
+        "object_id",
+        "objectid",
+        "oid",
+        "snid",
+        "diaobjectid",
+        "diaObjectId",
+        "id",
+    ]
+
+    object_col = None
+    lower_map = {str(c).lower(): c for c in context_df.columns}
+
+    for candidate in object_candidates:
+        if candidate.lower() in lower_map:
+            object_col = lower_map[candidate.lower()]
+            break
+
+    if object_col is not None:
+        matches = context_df[
+            context_df[object_col].astype(str).str.strip()
+            == str(selected_object).strip()
+        ]
+
+        if not matches.empty:
+            return matches.iloc[0], f"Matched context row by {object_col} = {selected_object}."
+
+        return context_df.iloc[0], (
+            f"No matching context row found for object_id = {selected_object}. "
+            "Using the first row."
+        )
+
+    return context_df.iloc[0], "No object_id column found in context table. Using the first row."
+
 def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domain="generic"):
     st.markdown("#### AstroTrust-AI prediction")
 
@@ -1573,6 +1852,41 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
 
     tabular_features = None
     allow_zero_tabular = False
+    extra_context_row = None
+
+    with st.expander("Optional host/context metadata", expanded=False):
+        st.caption(
+            "Upload an optional CSV/Parquet table with host-galaxy or contextual features "
+            "such as hostgal_zphot, hostgal_zphot_err, hostgal_mag_g, hostgal_color_g_r, hostgal_snsep."
+        )
+
+        context_upload = st.file_uploader(
+            "Upload host/context metadata table",
+            type=["csv", "parquet"],
+            key=f"context_metadata_{make_safe_filename(selected_object)}",
+        )
+
+        if context_upload is not None:
+            try:
+                context_df = read_context_metadata_file(context_upload)
+
+                st.success(
+                    f"Loaded context table with {len(context_df):,} rows and "
+                    f"{len(context_df.columns):,} columns."
+                )
+
+                with st.expander("Context table preview", expanded=False):
+                    st.dataframe(context_df.head(20), use_container_width=True)
+
+                extra_context_row, context_message = select_context_row(
+                    context_df,
+                    selected_object,
+                )
+
+                st.info(context_message)
+
+            except Exception as exc:
+                st.error(f"Could not read context metadata table: {exc}")
     use_auto_builder = prediction_mode.startswith("Full hybrid inference: auto-build")
     use_precomputed_features = prediction_mode.startswith("Full hybrid inference: auto-match")
     auto_feature_report = None
@@ -1669,11 +1983,16 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
             engine = get_inference_engine()
 
             if use_auto_builder:
+                combined_context_row = merge_metadata_rows(
+                    base_row=head_row,
+                    extra_row=extra_context_row,
+                )
+
                 tabular_features, auto_feature_report = build_v4_feature_row_auto(
-                lc_obj=lc_obj,
-                head_row=head_row,
-                expected_columns=engine.tabular_columns,
-            )
+                    lc_obj=lc_obj,
+                    head_row=combined_context_row,
+                    expected_columns=engine.tabular_columns,
+                )
                 allow_zero_tabular = False
 
             elif use_precomputed_features:
@@ -1720,6 +2039,14 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
             source_domain=source_domain,
             prediction_result=result,
         )
+
+        reliability = compute_prediction_reliability(
+            lc_obj=lc_obj,
+            auto_feature_report=auto_feature_report,
+            source_domain=source_domain,
+            prediction_result=result,
+        )
+
         if auto_feature_report is not None:
             st.info(
                 f"Auto-built v4 features: "
@@ -1753,7 +2080,18 @@ def render_prediction_panel(lc_obj, selected_object, head_row=None, source_domai
                         file_name=f"astrotrust_feature_coverage_{selected_object}.csv",
                         mime="text/csv",
                         use_container_width=True,
+                        key=f"download_feature_coverage_{make_safe_filename(selected_object)}",
+                        on_click="ignore",
                     )
+            
+            render_prediction_export_buttons(
+                selected_object=selected_object,
+                source_domain=source_domain,
+                lc_obj=lc_obj,
+                prediction_result=result,
+                reliability=reliability,
+                auto_feature_report=auto_feature_report,
+            )
         if result.get("used_zero_tabular_preview"):
             st.warning(
                 "This result used zero-filled tabular/context features. "
@@ -1808,6 +2146,10 @@ def show_upload_alert_lightcurve():
         show_snana_elasticc_pair_upload()
         return
 
+    if not HAS_DATA_ADAPTER:
+        st.error(f"AstroTrust data adapter could not be loaded: {DATA_ADAPTER_IMPORT_ERROR}")
+        return
+
     input_mode = st.radio(
         "Input mode",
         ["Browser upload", "Local file path", "URL"],
@@ -1816,14 +2158,19 @@ def show_upload_alert_lightcurve():
     )
 
     raw_df = None
-    source_type = None
+    lc = None
+    report = None
     source_label = None
 
     if input_mode == "Browser upload":
         uploaded = st.file_uploader(
             "Upload light-curve table",
             type=["csv", "parquet", "fits", "fit", "fts"],
-            help="Expected columns: object_id optional, mjd/time, band/filter/passband, flux, and optionally flux_err.",
+            help=(
+                "Accepted schemas include flux-based tables "
+                "(mjd, band, flux, flux_err) and magnitude-based real survey tables "
+                "(mjd, filter, mag, magerr)."
+            ),
             key="lightcurve_upload",
         )
 
@@ -1835,18 +2182,18 @@ def show_upload_alert_lightcurve():
 
                 | Column role | Accepted examples |
                 |---|---|
-                | Time | `mjd`, `time`, `jd` |
-                | Band/filter | `band`, `filter`, `passband`, `fid` |
+                | Time | `mjd`, `time`, `jd`, `hjd`, `bjd` |
+                | Band/filter | `band`, `filter`, `filtercode`, `passband`, `fid` |
                 | Flux | `flux`, `fluxcal`, `forcediffimflux` |
                 | Magnitude | `mag`, `magpsf`, `psfmag`, `magnitude` |
                 | Uncertainty | `flux_err`, `fluxerr`, `magerr`, `sigmapsf` |
-                | Object identifier | `object_id`, `diaObjectId`, `SNID` |
+                | Object identifier | `object_id`, `oid`, `diaObjectId`, `SNID` |
                 """
             )
             return
 
         try:
-            raw_df, source_type = read_uploaded_lightcurve_file(uploaded)
+            raw_df, lc, report = read_and_normalize_from_uploaded(uploaded)
             source_label = uploaded.name
         except Exception as exc:
             st.error(f"Could not read uploaded file: {exc}")
@@ -1865,7 +2212,7 @@ def show_upload_alert_lightcurve():
             return
 
         try:
-            raw_df, source_type = read_lightcurve_file_from_path(local_file)
+            raw_df, lc, report = read_and_normalize_from_path(local_file)
             source_label = str(local_file)
         except Exception as exc:
             st.error(f"Could not read local file: {exc}")
@@ -1887,48 +2234,71 @@ def show_upload_alert_lightcurve():
             return
 
         try:
-            with st.spinner("Downloading light-curve table from URL..."):
-                raw_df, source_type = read_lightcurve_file_from_url(url)
+            with st.spinner("Downloading and normalizing light-curve table from URL..."):
+                raw_df, lc, report = read_and_normalize_from_url(url)
                 source_label = url
         except Exception as exc:
             st.error(f"Could not read URL: {exc}")
             return
 
-    st.success(f"Loaded `{source_label}` as `{source_type}` with {len(raw_df):,} rows and {len(raw_df.columns):,} columns.")
+    report_dict = report.to_dict()
+
+    st.success(
+        f"Loaded `{source_label}` as `{report.source_type}` with "
+        f"{report.n_raw_rows:,} rows and {report.n_raw_columns:,} columns."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric("Detected domain", report.source_domain)
+    with c2:
+        st.metric("Objects", report.n_objects)
+    with c3:
+        st.metric("Normalized rows", report.n_output_rows)
+    with c4:
+        st.metric("Mag → flux", "Yes" if report.used_magnitude_conversion else "No")
+
+    for warning in report.warnings:
+        st.warning(warning)
+
+    for issue in report.issues:
+        st.error(issue)
+
+    with st.expander("Adapter report", expanded=False):
+        st.json(report_dict)
 
     with st.expander("Raw table preview", expanded=False):
         st.dataframe(raw_df.head(500), use_container_width=True)
 
-    inferred = infer_lightcurve_columns(raw_df)
     st.markdown("#### Column mapping")
-    mapping_df = pd.DataFrame([
-        {"role": role, "detected_column": col if col is not None else "—"}
-        for role, col in inferred.items()
-    ])
+    mapping_df = pd.DataFrame(
+        [
+            {
+                "role": role,
+                "detected_column": col if col is not None else "—",
+            }
+            for role, col in report.column_mapping.items()
+        ]
+    )
     st.dataframe(mapping_df, use_container_width=True, hide_index=True)
-
-    lc, issues = normalize_uploaded_lightcurve(raw_df, inferred)
-    if issues:
-        for issue in issues:
-            st.warning(issue)
 
     if lc.empty:
         st.error("The uploaded file could not be converted into a valid light curve.")
         return
 
-   
-    object_summary = summarize_uploaded_objects(lc)
+    object_summary = adapter_summarize_objects(lc)
 
     if object_summary.empty:
         selected_object = "single_object"
         lc["object_id"] = selected_object
-        lc_obj = lc
+        lc_obj = lc.copy()
 
     else:
-        object_values = object_summary["object_id"].tolist()
+        object_values = object_summary["object_id"].astype(str).tolist()
 
         def format_object_option(object_id):
-            row = object_summary[object_summary["object_id"] == str(object_id)].iloc[0]
+            row = object_summary[object_summary["object_id"].astype(str) == str(object_id)].iloc[0]
             return (
                 f"{row['object_id']}  |  "
                 f"bands={row['n_bands']}  |  "
@@ -1947,6 +2317,7 @@ def show_upload_alert_lightcurve():
         lc_obj = lc[lc["object_id"].astype(str) == str(selected_object)].copy()
 
     c1, c2, c3, c4 = st.columns(4)
+
     with c1:
         st.metric("Rows", len(lc_obj))
     with c2:
@@ -1959,28 +2330,15 @@ def show_upload_alert_lightcurve():
     plot_uploaded_lightcurve(lc_obj, title=f"Uploaded light curve: {selected_object}")
 
     st.markdown("#### Prediction readiness")
+
     checks = pd.DataFrame([
         {
-            "check": "Has time, band, and flux/mag",
-            "status": "OK"
-            if (
-                inferred.get("mjd") is not None
-                and inferred.get("band") is not None
-                and (
-                    inferred.get("flux") is not None
-                    or inferred.get("mag") is not None
-                )
-            )
-            else "Missing",
+            "check": "Has time, band, and flux",
+            "status": "OK" if all(c in lc_obj.columns for c in ["mjd", "band", "flux"]) else "Missing",
         },
         {
-            "check": "Has flux or magnitude uncertainty",
-            "status": "OK"
-            if (
-                inferred.get("flux_err") is not None
-                or inferred.get("mag_err") is not None
-            )
-            else "Recommended",
+            "check": "Has flux uncertainty",
+            "status": "OK" if ("flux_err" in lc_obj.columns and lc_obj["flux_err"].notna().any()) else "Recommended",
         },
         {
             "check": "At least 10 observations",
@@ -1991,14 +2349,15 @@ def show_upload_alert_lightcurve():
             "status": "OK" if lc_obj["band"].nunique() >= 2 else "Low",
         },
     ])
+
     st.dataframe(checks, use_container_width=True, hide_index=True)
 
     render_prediction_panel(
         lc_obj,
         selected_object,
-        source_domain="generic",
+        source_domain=report.source_domain,
     )
-    return
+
 
 def show_overview(assets):
     perf = assets["performance"]
