@@ -2777,9 +2777,585 @@ def show_candidate_explorer(class_names):
         st.warning("Light-curve cache not found. Run: python .\\app\\prepare_dashboard_data.py")
 
 
+
+def get_context_row_for_object(context_df: pd.DataFrame | None, object_id):
+    """Return a context row matching object_id, or None if no safe match exists."""
+    if context_df is None or context_df.empty:
+        return None
+
+    object_candidates = [
+        "object_id",
+        "objectid",
+        "oid",
+        "snid",
+        "diaobjectid",
+        "diaObjectId",
+        "id",
+    ]
+
+    lower_map = {str(c).lower(): c for c in context_df.columns}
+    object_col = None
+
+    for candidate in object_candidates:
+        if candidate.lower() in lower_map:
+            object_col = lower_map[candidate.lower()]
+            break
+
+    if object_col is None:
+        return None
+
+    matches = context_df[
+        context_df[object_col].astype(str).str.strip()
+        == str(object_id).strip()
+    ]
+
+    if matches.empty:
+        return None
+
+    return matches.iloc[0]
+
+
+def broker_action_label(row):
+    reliability = row.get("model_domain_reliability", "Unknown")
+    priority = row.get("priority_score", 0.0)
+    novelty = row.get("novelty", 0.0)
+
+    if reliability == "Low" and novelty >= 0.90:
+        return "OOD/anomaly review"
+
+    if reliability == "Low":
+        return "Use with caution"
+
+    if priority >= 0.70 and reliability in ["Good", "Limited"]:
+        return "High follow-up priority"
+
+    if priority >= 0.40:
+        return "Medium follow-up priority"
+
+    return "Low follow-up priority"
+
+
+def broker_queue_label(row):
+    reliability = row.get("model_domain_reliability", "Unknown")
+    novelty = row.get("novelty", 0.0)
+    priority = row.get("priority_score", 0.0)
+    status = row.get("status", "OK")
+
+    if status != "OK":
+        return "Failed"
+
+    if reliability == "Low" and novelty >= 0.90:
+        return "OOD/anomaly review"
+
+    if reliability in ["Good", "Limited"] and priority >= 0.40:
+        return "Validated follow-up"
+
+    return "Low priority"
+
+
+def reliability_weight(level):
+    return {
+        "Good": 1.0,
+        "Limited": 0.6,
+        "Low": 0.2,
+    }.get(level, 0.2)
+
+def run_live_broker_batch(
+    lc: pd.DataFrame,
+    source_domain: str,
+    context_df: pd.DataFrame | None = None,
+    max_objects: int = 50,
+):
+    """Run AstroTrust-AI inference for multiple uploaded candidates."""
+    if lc.empty:
+        return pd.DataFrame()
+
+    engine = get_inference_engine()
+    object_summary = adapter_summarize_objects(lc)
+
+    if object_summary.empty:
+        return pd.DataFrame()
+
+    object_summary = object_summary.head(max_objects).copy()
+
+    rows = []
+    progress = st.progress(0)
+    status_box = st.empty()
+
+    for idx, obj_row in object_summary.iterrows():
+        object_id = obj_row["object_id"]
+        status_box.info(f"Processing object {idx + 1}/{len(object_summary)}: {object_id}")
+
+        lc_obj = lc[lc["object_id"].astype(str) == str(object_id)].copy()
+
+        try:
+            context_row = get_context_row_for_object(context_df, object_id)
+
+            tabular_features, auto_feature_report = build_v4_feature_row_auto(
+                lc_obj=lc_obj,
+                head_row=context_row,
+                expected_columns=engine.tabular_columns,
+            )
+
+            result = engine.predict_from_lightcurve(
+                lightcurve_df=lc_obj,
+                tabular_features=tabular_features,
+                allow_zero_tabular=False,
+            )
+
+            reliability = compute_prediction_reliability(
+                lc_obj=lc_obj,
+                auto_feature_report=auto_feature_report,
+                source_domain=source_domain,
+                prediction_result=result,
+            )
+
+            input_quality = reliability["input_quality"]["level"]
+            feature_completeness = reliability["feature_completeness"]["level"]
+            model_domain_reliability = reliability["model_domain_reliability"]["level"]
+
+            row = {
+                "object_id": object_id,
+                "source_domain": source_domain,
+                "predicted_class": result.get("predicted_class_name"),
+                "confidence": result.get("confidence"),
+                "uncertainty": result.get("uncertainty_score"),
+                "novelty": result.get("novelty_score"),
+                "rarity": result.get("rarity_score"),
+                "priority_score": result.get("priority_score"),
+                "is_predicted_rare": result.get("is_predicted_rare"),
+                "input_quality": input_quality,
+                "feature_completeness": feature_completeness,
+                "model_domain_reliability": model_domain_reliability,
+                "n_obs": len(lc_obj),
+                "n_bands": lc_obj["band"].nunique(),
+                "time_span": float(lc_obj["mjd"].max() - lc_obj["mjd"].min())
+                if len(lc_obj) > 1
+                else 0.0,
+                "n_expected_features": auto_feature_report.get("n_expected_features"),
+                "n_matched_features": auto_feature_report.get("n_matched_features"),
+                "n_missing_filled_zero": auto_feature_report.get("n_missing_filled_zero"),
+                "status": "OK",
+            }
+
+            top_classes = result.get("top_classes", [])
+
+            if len(top_classes) > 0:
+                row["top1_class"] = top_classes[0].get("class_name")
+                row["top1_probability"] = top_classes[0].get("probability")
+
+            if len(top_classes) > 1:
+                row["top2_class"] = top_classes[1].get("class_name")
+                row["top2_probability"] = top_classes[1].get("probability")
+
+            if len(top_classes) > 2:
+                row["top3_class"] = top_classes[2].get("class_name")
+                row["top3_probability"] = top_classes[2].get("probability")
+
+            row["broker_action"] = broker_action_label(row)
+            row["broker_queue"] = broker_queue_label(row)
+            row["reliability_adjusted_priority"] = (
+                float(row["priority_score"]) * reliability_weight(row["model_domain_reliability"])
+                if row["priority_score"] is not None
+                else None
+            )
+
+            queue_rank_map = {
+                "Validated follow-up": 0,
+                "OOD/anomaly review": 1,
+                "Low priority": 2,
+                "Failed": 3,
+            }
+
+            row["broker_queue_rank"] = queue_rank_map.get(row["broker_queue"], 9)
+            rows.append(row)
+
+
+        except Exception as exc:
+            rows.append(
+                {
+                    "object_id": object_id,
+                    "source_domain": source_domain,
+                    "predicted_class": None,
+                    "confidence": None,
+                    "uncertainty": None,
+                    "novelty": None,
+                    "rarity": None,
+                    "priority_score": None,
+                    "input_quality": None,
+                    "feature_completeness": None,
+                    "model_domain_reliability": None,
+                    "n_obs": len(lc_obj),
+                    "n_bands": lc_obj["band"].nunique() if "band" in lc_obj.columns else None,
+                    "time_span": None,
+                    "n_expected_features": None,
+                    "n_matched_features": None,
+                    "n_missing_filled_zero": None,
+                    "status": f"FAILED: {exc}",
+                    "broker_action": "Failed",
+                }
+            )
+
+        progress.progress((idx + 1) / len(object_summary))
+
+    status_box.success("Live broker batch finished.")
+    progress.empty()
+
+    ranking = pd.DataFrame(rows)
+
+    if not ranking.empty:
+        queue_rank_map = {
+            "Validated follow-up": 0,
+            "OOD/anomaly review": 1,
+            "Low priority": 2,
+            "Failed": 3,
+        }
+
+        if "broker_queue" not in ranking.columns:
+            ranking["broker_queue"] = "Low priority"
+
+        ranking["broker_queue_rank"] = (
+            ranking["broker_queue"]
+            .map(queue_rank_map)
+            .fillna(9)
+            .astype(int)
+        )
+
+        if "reliability_adjusted_priority" not in ranking.columns:
+            ranking["reliability_adjusted_priority"] = ranking.get("priority_score", 0.0)
+
+        ranking = ranking.sort_values(
+            [
+                "broker_queue_rank",
+                "reliability_adjusted_priority",
+                "priority_score",
+                "novelty",
+            ],
+            ascending=[True, False, False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+
+        if "broker_rank" in ranking.columns:
+            ranking = ranking.drop(columns=["broker_rank"])
+
+        ranking.insert(0, "broker_rank", range(1, len(ranking) + 1))
+
+    return ranking
+
+
+def show_live_broker_mode():
+    st.subheader("Live Broker Mode")
+    st.caption(
+        "Upload or link a table containing multiple candidates. "
+        "AstroTrust-AI will classify each object and rank candidates for follow-up."
+    )
+
+    if not HAS_DATA_ADAPTER:
+        st.error(f"AstroTrust data adapter could not be loaded: {DATA_ADAPTER_IMPORT_ERROR}")
+        return
+
+    if not HAS_ASTROTRUST_INFERENCE:
+        st.error(f"Inference module could not be loaded: {ASTROTRUST_INFERENCE_IMPORT_ERROR}")
+        return
+
+    input_mode = st.radio(
+        "Input mode",
+        ["Browser upload", "Local file path", "URL"],
+        horizontal=True,
+        key="live_broker_input_mode",
+    )
+
+    raw_df = None
+    lc = None
+    report = None
+    source_label = None
+
+    if input_mode == "Browser upload":
+        uploaded = st.file_uploader(
+            "Upload batch light-curve table",
+            type=["csv", "parquet", "fits", "fit", "fts"],
+            key="live_broker_upload",
+            help="The table should contain multiple rows and preferably multiple object_id values.",
+        )
+
+        if uploaded is None:
+            st.info("Upload a CSV, Parquet, or FITS table with one or more candidate light curves.")
+            return
+
+        try:
+            raw_df, lc, report = read_and_normalize_from_uploaded(uploaded)
+            source_label = uploaded.name
+        except Exception as exc:
+            st.error(f"Could not read uploaded file: {exc}")
+            return
+
+    elif input_mode == "Local file path":
+        local_file = interactive_local_file_picker(
+            label="Local batch light-curve path",
+            suffixes=[".csv", ".parquet", ".fits", ".fit", ".fts"],
+            default_dir=str(ROOT_DIR / "data" / "processed" / "elasticc2_large"),
+            key_prefix="live_broker_local",
+        )
+
+        if local_file is None:
+            st.info("Select a local CSV, Parquet, or FITS table.")
+            return
+
+        try:
+            raw_df, lc, report = read_and_normalize_from_path(local_file)
+            source_label = str(local_file)
+        except Exception as exc:
+            st.error(f"Could not read local file: {exc}")
+            return
+
+    else:
+        url = st.text_input(
+            "Batch light-curve table URL",
+            placeholder="https://irsa.ipac.caltech.edu/cgi-bin/ZTF/nph_light_curves?...&FORMAT=CSV",
+            key="live_broker_url",
+        )
+
+        if not url:
+            st.info("Paste a public CSV/Parquet URL. For IRSA/ZTF, use FORMAT=CSV.")
+            return
+
+        try:
+            with st.spinner("Downloading and normalizing batch light-curve table..."):
+                raw_df, lc, report = read_and_normalize_from_url(url)
+                source_label = url
+        except Exception as exc:
+            st.error(f"Could not read URL: {exc}")
+            return
+
+    st.success(
+        f"Loaded `{source_label}` as `{report.source_type}` with "
+        f"{report.n_raw_rows:,} rows and {report.n_objects:,} objects."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric("Detected domain", report.source_domain)
+    with c2:
+        st.metric("Objects", report.n_objects)
+    with c3:
+        st.metric("Normalized rows", report.n_output_rows)
+    with c4:
+        st.metric("Mag → flux", "Yes" if report.used_magnitude_conversion else "No")
+
+    domain_override = st.selectbox(
+        "Source domain override",
+        [
+            "Auto-detected",
+            "ELAsTiCC / LSST-like",
+            "ZTF / IRSA",
+            "Generic real-survey",
+        ],
+        index=0,
+        help=(
+            "Use this only when you know the origin of the uploaded data. "
+            "For processed ELAsTiCC/LSST-like files, choose ELAsTiCC / LSST-like."
+        ),
+        key="live_broker_domain_override",
+    )
+
+    effective_source_domain = report.source_domain
+
+    if domain_override == "ELAsTiCC / LSST-like":
+        effective_source_domain = "snana_elasticc"
+    elif domain_override == "ZTF / IRSA":
+        effective_source_domain = "ztf_irsa"
+    elif domain_override == "Generic real-survey":
+        effective_source_domain = "generic"
+    for warning in report.warnings:
+        st.warning(warning)
+
+    with st.expander("Adapter report", expanded=False):
+        st.json(report.to_dict())
+
+    with st.expander("Raw table preview", expanded=False):
+        st.dataframe(raw_df.head(300), use_container_width=True)
+
+    with st.expander("Normalized light-curve preview", expanded=False):
+        st.dataframe(lc.head(300), use_container_width=True)
+
+    object_summary = adapter_summarize_objects(lc)
+
+    st.markdown("#### Candidate objects detected")
+    st.dataframe(object_summary.head(100), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Optional batch host/context metadata")
+
+    context_df = None
+    context_upload = st.file_uploader(
+        "Upload optional host/context metadata CSV or Parquet",
+        type=["csv", "parquet"],
+        key="live_broker_context_upload",
+        help="Optional table with object_id and host/context features.",
+    )
+
+    if context_upload is not None:
+        try:
+            context_df = read_context_metadata_file(context_upload)
+            st.success(
+                f"Loaded context table with {len(context_df):,} rows and "
+                f"{len(context_df.columns):,} columns."
+            )
+
+            with st.expander("Context metadata preview", expanded=False):
+                st.dataframe(context_df.head(100), use_container_width=True)
+
+        except Exception as exc:
+            st.error(f"Could not read context metadata: {exc}")
+            context_df = None
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        max_objects = st.number_input(
+            "Maximum objects to process",
+            min_value=1,
+            max_value=1000,
+            value=min(50, max(1, int(report.n_objects))),
+            step=1,
+            help="Batch inference can take time. Start with a small number for testing.",
+        )
+
+    with c2:
+        st.metric("Processing mode", "Auto-build v4 features")
+
+    run_batch = st.button(
+        "Run live broker ranking",
+        type="primary",
+        use_container_width=True,
+        key="run_live_broker_ranking",
+    )
+
+    if run_batch:
+        with st.spinner("Running live broker inference..."):
+            ranking = run_live_broker_batch(
+                lc=lc,
+                source_domain=effective_source_domain,
+                context_df=context_df,
+                max_objects=int(max_objects),
+            )
+
+        st.session_state["live_broker_ranking"] = ranking
+
+    ranking = st.session_state.get("live_broker_ranking")
+
+    if ranking is None or ranking.empty:
+        return
+
+    st.markdown("### Live broker ranking")
+
+    queue_order = [
+        "Validated follow-up",
+        "OOD/anomaly review",
+        "Low priority",
+        "Failed",
+    ]
+    if "broker_queue" in ranking.columns:
+        queue_counts = (
+            ranking["broker_queue"]
+            .value_counts()
+            .reindex(queue_order, fill_value=0)
+            .rename_axis("broker_queue")
+            .reset_index(name="count")
+        )
+
+        st.markdown("#### Broker queue summary")
+        st.dataframe(queue_counts, use_container_width=True, hide_index=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            st.metric(
+                "Validated follow-up",
+                int((ranking["broker_queue"] == "Validated follow-up").sum()),
+            )
+
+        with c2:
+            st.metric(
+                "OOD/anomaly review",
+                int((ranking["broker_queue"] == "OOD/anomaly review").sum()),
+            )
+
+        with c3:
+            st.metric(
+                "Low priority",
+                int((ranking["broker_queue"] == "Low priority").sum()),
+            )
+
+        with c4:
+            st.metric(
+                "Failed",
+                int((ranking["broker_queue"] == "Failed").sum()),
+            )
+
+    ok_ranking = ranking[ranking["status"] == "OK"].copy()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric("Processed", len(ranking))
+    with c2:
+        st.metric("Successful", len(ok_ranking))
+    with c3:
+        safe_metric("Mean novelty", ok_ranking["novelty"].mean() if not ok_ranking.empty else None)
+    with c4:
+        safe_metric("Mean priority", ok_ranking["priority_score"].mean() if not ok_ranking.empty else None)
+
+    display_cols = [
+        "broker_queue",
+        "reliability_adjusted_priority",
+        "broker_rank",
+        "object_id",
+        "predicted_class",
+        "confidence",
+        "novelty",
+        "rarity",
+        "priority_score",
+        "input_quality",
+        "feature_completeness",
+        "model_domain_reliability",
+        "n_obs",
+        "n_bands",
+        "n_matched_features",
+        "n_missing_filled_zero",
+        "broker_action",
+        "status",
+    ]
+
+    display_cols = [c for c in display_cols if c in ranking.columns]
+
+    st.dataframe(ranking[display_cols], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download live broker ranking CSV",
+        data=ranking.to_csv(index=False).encode("utf-8"),
+        file_name="astrotrust_live_broker_ranking.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_live_broker_ranking_csv",
+        on_click="ignore",
+    )
+
+
 def show_broker_view(class_names):
     st.subheader("Broker view")
     st.caption("Operational view for top follow-up budgets. This is useful for simulating limited observing resources.")
+
+    broker_source = st.radio(
+        "Broker source",
+        ["Precomputed experiment ranking", "Live uploaded candidates"],
+        horizontal=True,
+        key="broker_source_mode",
+    )
+
+    if broker_source == "Live uploaded candidates":
+        show_live_broker_mode()
+        return
 
     policy_label = st.selectbox("Policy", list(POLICY_FILES.keys()), index=0, key="broker_policy")
     ranking = load_ranking(policy_label)
