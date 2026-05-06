@@ -232,6 +232,13 @@ def save_predictions(name, object_ids_test, y_true, y_pred, probabilities):
     }).to_csv(OUTPUT_DIR / f"{name}_predictions.csv", index=False)
 
 
+def save_probabilities(name, probabilities):
+    np.save(
+        OUTPUT_DIR / f"{name}_test_probabilities.npy",
+        probabilities.astype(np.float32),
+    )
+
+
 def check_hybrid_alignment(object_ids_test, y_test):
     if not HYBRID_PREDS_PATH.exists():
         print("[WARN] Hybrid predictions file not found. Skipping alignment check.")
@@ -324,6 +331,7 @@ def main():
     )
     results.append(metrics)
     save_predictions("hybrid_cnn_tabular", object_ids_test, y_test, y_pred, hybrid_probs)
+    save_probabilities("hybrid_cnn_tabular", hybrid_probs)
     save_report("hybrid_cnn_tabular", y_test, y_pred)
 
     tabular_models = [
@@ -355,6 +363,7 @@ def main():
         results.append(metrics)
 
         save_predictions(name, object_ids_test, y_test, y_pred, probs)
+        save_probabilities(name, probs)
         save_report(name, y_test, y_pred)
 
     ensemble_configs = {
@@ -431,6 +440,7 @@ def main():
         results.append(metrics)
 
         save_predictions(ensemble_name, object_ids_test, y_test, y_pred, probs)
+        save_probabilities(ensemble_name, probs)
         save_report(ensemble_name, y_test, y_pred)
 
     results_df = pd.DataFrame(results)
