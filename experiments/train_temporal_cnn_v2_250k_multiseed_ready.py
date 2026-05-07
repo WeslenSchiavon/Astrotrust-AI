@@ -1,6 +1,6 @@
 from pathlib import Path
 import time
-import json
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -37,18 +37,71 @@ CLASS_COUNTS_PATH = (
     / "full_class_counts.csv"
 )
 
-OUTPUT_DIR = ROOT_DIR / "results" / "temporal_cnn_250k"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "results" / "temporal_cnn_v2_250k"
 
-RANDOM_STATE = 42
+DEFAULT_SPLIT_SEED = 42
 TEST_SIZE = 0.25
 VAL_SIZE_FROM_TRAIN = 0.15
 
 BATCH_SIZE = 512
-EPOCHS = 50
-PATIENCE = 8
-LEARNING_RATE = 1e-3
+EPOCHS = 120
+PATIENCE = 18
+LEARNING_RATE = 7e-4
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 0
+LABEL_SMOOTHING = 0.02
+GRAD_CLIP_NORM = 3.0
+
+
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = True
+
+
+def top_k_accuracy(y_true, y_prob, k: int) -> float:
+    k = min(k, y_prob.shape[1])
+    topk = np.argpartition(-y_prob, kth=k - 1, axis=1)[:, :k]
+    return float(np.mean([yt in row for yt, row in zip(y_true, topk)]))
+
+
+def multiclass_brier_score(y_true, y_prob, n_classes: int) -> float:
+    y_onehot = np.zeros((len(y_true), n_classes), dtype=np.float32)
+    y_onehot[np.arange(len(y_true)), y_true.astype(int)] = 1.0
+    return float(np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1)))
+
+
+def negative_log_likelihood(y_true, y_prob, eps: float = 1e-12) -> float:
+    probs = np.clip(y_prob[np.arange(len(y_true)), y_true.astype(int)], eps, 1.0)
+    return float(-np.mean(np.log(probs)))
+
+
+def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
+    confidences = np.max(y_prob, axis=1)
+    predictions = np.argmax(y_prob, axis=1)
+    correct = (predictions == y_true).astype(float)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (confidences >= lo) & (confidences <= hi)
+        else:
+            mask = (confidences >= lo) & (confidences < hi)
+        if not np.any(mask):
+            continue
+        bin_acc = float(np.mean(correct[mask]))
+        bin_conf = float(np.mean(confidences[mask]))
+        ece += float(np.mean(mask)) * abs(bin_acc - bin_conf)
+    return float(ece)
 
 
 class LightCurveDataset(Dataset):
@@ -65,48 +118,102 @@ class LightCurveDataset(Dataset):
         return x, y
 
 
-class TemporalCNN(nn.Module):
+class ResidualDilatedBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation, dropout):
+        super().__init__()
+
+        padding = dilation
+
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+        if in_channels != out_channels:
+            self.proj = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.proj = nn.Identity()
+
+    def forward(self, x):
+        residual = self.proj(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = out + residual
+        out = self.act(out)
+        out = self.dropout(out)
+
+        return out
+
+
+class TemporalCNNv2(nn.Module):
     def __init__(self, n_channels=18, n_classes=32):
         super().__init__()
 
-        self.features = nn.Sequential(
+        self.stem = nn.Sequential(
             nn.Conv1d(n_channels, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.10),
-
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.15),
-
-            nn.Conv1d(128, 256, kernel_size=5, padding=2),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.20),
-
-            nn.Conv1d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.20),
+            nn.GELU(),
+            nn.Dropout(0.05),
         )
 
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.blocks = nn.Sequential(
+            ResidualDilatedBlock(64, 128, dilation=1, dropout=0.10),
+            ResidualDilatedBlock(128, 128, dilation=2, dropout=0.10),
+            ResidualDilatedBlock(128, 192, dilation=4, dropout=0.15),
+            ResidualDilatedBlock(192, 256, dilation=8, dropout=0.15),
+            ResidualDilatedBlock(256, 256, dilation=16, dropout=0.20),
+        )
+
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Dropout(0.30),
-            nn.Linear(256, n_classes),
+            nn.Linear(512, 384),
+            nn.BatchNorm1d(384),
+            nn.GELU(),
+            nn.Dropout(0.35),
+
+            nn.Linear(384, 192),
+            nn.GELU(),
+            nn.Dropout(0.25),
+
+            nn.Linear(192, n_classes),
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.pool(x)
+        x = self.stem(x)
+        x = self.blocks(x)
+
+        avg = self.avg_pool(x)
+        mx = self.max_pool(x)
+
+        x = torch.cat([avg, mx], dim=1)
         x = self.classifier(x)
+
         return x
 
 
@@ -124,10 +231,12 @@ def evaluate_model(model, loader, device):
 
     with torch.no_grad():
         for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
 
-            logits = model(X_batch)
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                logits = model(X_batch)
+
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(probs, dim=1)
 
@@ -139,12 +248,20 @@ def evaluate_model(model, loader, device):
     y_pred = np.concatenate(y_pred)
     y_prob = np.concatenate(y_prob)
 
+    n_classes = y_prob.shape[1]
+
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro"),
         "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
+        "top2_accuracy": top_k_accuracy(y_true, y_prob, 2),
+        "top3_accuracy": top_k_accuracy(y_true, y_prob, 3),
+        "top5_accuracy": top_k_accuracy(y_true, y_prob, 5),
         "mean_confidence": float(np.max(y_prob, axis=1).mean()),
+        "ece": expected_calibration_error(y_true, y_prob, n_bins=15),
+        "brier_score": multiclass_brier_score(y_true, y_prob, n_classes=n_classes),
+        "negative_log_likelihood": negative_log_likelihood(y_true, y_prob),
     }
 
     return metrics, y_true, y_pred, y_prob
@@ -157,8 +274,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
     n_samples = 0
 
     for X_batch, y_batch in loader:
-        X_batch = X_batch.to(device)
-        y_batch = y_batch.to(device)
+        X_batch = X_batch.to(device, non_blocking=True)
+        y_batch = y_batch.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -167,6 +284,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
             loss = criterion(logits, y_batch)
 
         scaler.scale(loss).backward()
+
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -178,8 +299,20 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Train temporal CNN 250k with multi-seed support.")
+    parser.add_argument("--seed", type=int, default=42, help="Training random seed.")
+    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED, help="Fixed split seed for train/val/test.")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory where outputs are saved.")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic CuDNN settings when possible.")
+    args = parser.parse_args()
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    set_global_seed(args.seed, deterministic=args.deterministic)
+
+    print(f"Training seed: {args.seed}")
+    print(f"Split seed:    {args.split_seed}")
+    print(f"Output dir:    {output_dir}")
     print(f"Loading tensor dataset: {TENSOR_PATH}")
 
     data = np.load(TENSOR_PATH, allow_pickle=True)
@@ -196,20 +329,20 @@ def main():
     print(f"Objects: {n_objects}")
     print(f"Classes: {n_classes}")
     print(f"X_lc shape: {X_lc.shape}")
-    print(f"Class distribution:")
+    print("Class distribution:")
     print(pd.Series(y).value_counts().sort_index())
 
     train_idx, test_idx = train_test_split(
         np.arange(n_objects),
         test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
+        random_state=args.split_seed,
         stratify=y,
     )
 
     train_idx, val_idx = train_test_split(
         train_idx,
         test_size=VAL_SIZE_FROM_TRAIN,
-        random_state=RANDOM_STATE,
+        random_state=args.split_seed,
         stratify=y[train_idx],
     )
 
@@ -222,10 +355,14 @@ def main():
     val_dataset = LightCurveDataset(X_lc[val_idx], y[val_idx])
     test_dataset = LightCurveDataset(X_lc[test_idx], y[test_idx])
 
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
+        generator=train_generator,
         num_workers=NUM_WORKERS,
         pin_memory=True,
     )
@@ -253,7 +390,7 @@ def main():
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    model = TemporalCNN(
+    model = TemporalCNNv2(
         n_channels=n_channels,
         n_classes=n_classes,
     ).to(device)
@@ -273,7 +410,10 @@ def main():
 
     class_weights_tensor = torch.tensor(full_weights, dtype=torch.float32).to(device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights_tensor,
+        label_smoothing=LABEL_SMOOTHING,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -285,7 +425,7 @@ def main():
         optimizer,
         mode="max",
         factor=0.5,
-        patience=3,
+        patience=5,
     )
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -295,10 +435,9 @@ def main():
     patience_counter = 0
 
     history = []
+    best_model_path = output_dir / "best_temporal_cnn_v2.pt"
 
-    best_model_path = OUTPUT_DIR / "best_temporal_cnn.pt"
-
-    print("\nTraining temporal CNN...")
+    print("\nTraining TemporalCNN v2...")
 
     start_time = time.time()
 
@@ -334,7 +473,7 @@ def main():
             f"lr={optimizer.param_groups[0]['lr']:.6f}"
         )
 
-        pd.DataFrame(history).to_csv(OUTPUT_DIR / "training_history.csv", index=False)
+        pd.DataFrame(history).to_csv(output_dir / "training_history.csv", index=False)
 
         if val_metrics["macro_f1"] > best_val_macro_f1:
             best_val_macro_f1 = val_metrics["macro_f1"]
@@ -380,6 +519,11 @@ def main():
     print(f"Macro-F1:          {test_metrics['macro_f1']:.4f}")
     print(f"Weighted-F1:       {test_metrics['weighted_f1']:.4f}")
     print(f"Mean confidence:   {test_metrics['mean_confidence']:.4f}")
+    print(f"Top-3 accuracy:    {test_metrics['top3_accuracy']:.4f}")
+    print(f"Top-5 accuracy:    {test_metrics['top5_accuracy']:.4f}")
+    print(f"ECE:               {test_metrics['ece']:.4f}")
+    print(f"Brier score:       {test_metrics['brier_score']:.4f}")
+    print(f"NLL:               {test_metrics['negative_log_likelihood']:.4f}")
 
     label_to_name = load_label_names()
     labels = sorted(np.unique(y_true))
@@ -396,11 +540,11 @@ def main():
     print("\nClassification report:")
     print(report)
 
-    with open(OUTPUT_DIR / "temporal_cnn_classification_report.txt", "w", encoding="utf-8") as f:
+    with open(output_dir / "temporal_cnn_v2_classification_report.txt", "w", encoding="utf-8") as f:
         f.write(report)
 
     pd.DataFrame([{
-        "model": "temporal_cnn_lc_only",
+        "model": "temporal_cnn_v2_residual_dilated",
         "n_objects": n_objects,
         "n_train": len(train_idx),
         "n_val": len(val_idx),
@@ -411,7 +555,7 @@ def main():
         "best_val_macro_f1": best_val_macro_f1,
         "training_time_minutes": elapsed / 60,
         **test_metrics,
-    }]).to_csv(OUTPUT_DIR / "temporal_cnn_test_metrics.csv", index=False)
+    }]).to_csv(output_dir / "temporal_cnn_v2_test_metrics.csv", index=False)
 
     pd.DataFrame({
         "object_id": object_ids[test_idx],
@@ -419,16 +563,16 @@ def main():
         "predicted_label": y_pred,
         "correct": y_true == y_pred,
         "confidence": np.max(y_prob, axis=1),
-    }).to_csv(OUTPUT_DIR / "temporal_cnn_test_predictions.csv", index=False)
+    }).to_csv(output_dir / "temporal_cnn_v2_test_predictions.csv", index=False)
 
-    np.save(OUTPUT_DIR / "temporal_cnn_test_probabilities.npy", y_prob)
+    np.save(output_dir / "temporal_cnn_v2_test_probabilities.npy", y_prob)
 
     print("\nSaved:")
     print(f"- {best_model_path}")
-    print(f"- {OUTPUT_DIR / 'training_history.csv'}")
-    print(f"- {OUTPUT_DIR / 'temporal_cnn_test_metrics.csv'}")
-    print(f"- {OUTPUT_DIR / 'temporal_cnn_test_predictions.csv'}")
-    print(f"- {OUTPUT_DIR / 'temporal_cnn_test_probabilities.npy'}")
+    print(f"- {output_dir / 'training_history.csv'}")
+    print(f"- {output_dir / 'temporal_cnn_v2_test_metrics.csv'}")
+    print(f"- {output_dir / 'temporal_cnn_v2_test_predictions.csv'}")
+    print(f"- {output_dir / 'temporal_cnn_v2_test_probabilities.npy'}")
 
 
 if __name__ == "__main__":

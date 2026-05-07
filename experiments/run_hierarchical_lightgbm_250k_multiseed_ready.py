@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 import json
 import warnings
+import random
 
 import numpy as np
 import pandas as pd
@@ -59,6 +60,12 @@ DEFAULT_LABEL_METADATA = (
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "results" / "hierarchical_lightgbm_250k"
 
 RANDOM_STATE = 42
+DEFAULT_SPLIT_SEED = 42
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def map_to_family(class_name: str) -> str:
@@ -330,11 +337,20 @@ def main():
     parser.add_argument("--split-metadata", type=Path, default=DEFAULT_SPLIT_METADATA)
     parser.add_argument("--label-metadata", type=Path, default=DEFAULT_LABEL_METADATA)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--seed", type=int, default=42, help="Training random seed for tabular models.")
+    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED, help="Fallback split seed; ignored when split metadata is available.")
     parser.add_argument("--model-kind", choices=["lightgbm", "hgb"], default="lightgbm")
     parser.add_argument("--train-family-on-trainval", action="store_true", help="Train final family/subclass models on train+val before testing.")
     args = parser.parse_args()
 
+    global RANDOM_STATE
+    RANDOM_STATE = int(args.seed)
+    set_global_seed(args.seed)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Training seed: {args.seed}")
+    print(f"Split seed:    {args.split_seed}")
+    print(f"Output dir:    {args.output_dir}")
 
     X, y, object_ids, npz_data = load_dataset(args.tensor_dataset)
     n_classes = int(np.max(y)) + 1

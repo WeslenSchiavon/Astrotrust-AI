@@ -1,4 +1,8 @@
 from pathlib import Path
+import argparse
+import json
+import os
+import random
 import time
 
 import numpy as np
@@ -37,7 +41,8 @@ CLASS_COUNTS_PATH = (
     / "full_class_counts.csv"
 )
 
-OUTPUT_DIR = ROOT_DIR / "results" / "hybrid_temporal_tabular_cnn_250k"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "results" / "hybrid_temporal_tabular_cnn_250k"
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
 RANDOM_STATE = 42
 TEST_SIZE = 0.25
@@ -49,6 +54,51 @@ PATIENCE = 10
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train the final 250k hybrid temporal-tabular CNN with explicit seed and output directory."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Training random seed. Controls weight initialization, dropout, and batch shuffling.",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Random seed used only for train/validation/test splitting. Keep fixed across multi-seed runs to isolate training stochasticity.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory where model outputs will be saved.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use more deterministic CUDA settings. This can reduce speed and may not make every GPU operation fully deterministic.",
+    )
+    return parser.parse_args()
+
+
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # Deterministic mode is optional because it can slow down training and some
+    # CUDA operations may still be non-deterministic depending on the backend.
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
 
 
 class HybridDataset(Dataset):
@@ -146,6 +196,64 @@ def load_label_names():
     return dict(zip(counts["label"].astype(int), counts["class_name"].astype(str)))
 
 
+
+def top_k_accuracy(y_true, y_prob, k: int) -> float:
+    k = min(k, y_prob.shape[1])
+    topk = np.argpartition(-y_prob, kth=k - 1, axis=1)[:, :k]
+    return float(np.mean([yt in row for yt, row in zip(y_true, topk)]))
+
+
+def multiclass_brier_score(y_true, y_prob, n_classes: int) -> float:
+    y_prob = sanitize_probabilities(y_prob)
+    y_onehot = np.zeros((len(y_true), n_classes), dtype=np.float64)
+    y_onehot[np.arange(len(y_true)), y_true.astype(int)] = 1.0
+    return float(np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1)))
+
+
+def sanitize_probabilities(y_prob, eps: float = 1e-12) -> np.ndarray:
+    """Return finite, float64, clipped and row-normalized probabilities.
+
+    This avoids log(0) when probabilities were produced under mixed precision
+    and very small values were rounded to exact zero.
+    """
+    probs = np.asarray(y_prob, dtype=np.float64)
+    probs = np.nan_to_num(probs, nan=eps, posinf=1.0, neginf=eps)
+    probs = np.clip(probs, eps, 1.0)
+
+    row_sum = probs.sum(axis=1, keepdims=True)
+    probs = probs / np.maximum(row_sum, eps)
+    probs = np.clip(probs, eps, 1.0)
+    probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), eps)
+    return probs
+
+
+def negative_log_likelihood(y_true, y_prob, eps: float = 1e-12) -> float:
+    probs = sanitize_probabilities(y_prob, eps=eps)
+    true_probs = probs[np.arange(len(y_true)), y_true.astype(int)]
+    return float(-np.mean(np.log(true_probs)))
+
+
+def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
+    y_prob = sanitize_probabilities(y_prob)
+    confidences = np.max(y_prob, axis=1)
+    predictions = np.argmax(y_prob, axis=1)
+    correct = (predictions == y_true).astype(float)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (confidences >= lo) & (confidences <= hi)
+        else:
+            mask = (confidences >= lo) & (confidences < hi)
+        if not np.any(mask):
+            continue
+        bin_acc = float(np.mean(correct[mask]))
+        bin_conf = float(np.mean(confidences[mask]))
+        ece += float(np.mean(mask)) * abs(bin_acc - bin_conf)
+    return float(ece)
+
+
 def evaluate_model(model, loader, device):
     model.eval()
 
@@ -162,7 +270,9 @@ def evaluate_model(model, loader, device):
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 logits = model(X_lc_batch, X_tab_batch)
 
-            probs = torch.softmax(logits, dim=1)
+            # Force softmax in float32 even when AMP is active. This reduces
+            # probability underflow and avoids exact zeros in downstream metrics.
+            probs = torch.softmax(logits.float(), dim=1)
             preds = torch.argmax(probs, dim=1)
 
             y_true.append(y_batch.cpu().numpy())
@@ -171,14 +281,21 @@ def evaluate_model(model, loader, device):
 
     y_true = np.concatenate(y_true)
     y_pred = np.concatenate(y_pred)
-    y_prob = np.concatenate(y_prob)
+    y_prob = sanitize_probabilities(np.concatenate(y_prob))
 
+    n_classes = y_prob.shape[1]
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro"),
         "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
         "mean_confidence": float(np.max(y_prob, axis=1).mean()),
+        "top2_accuracy": top_k_accuracy(y_true, y_prob, 2),
+        "top3_accuracy": top_k_accuracy(y_true, y_prob, 3),
+        "top5_accuracy": top_k_accuracy(y_true, y_prob, 5),
+        "ece": expected_calibration_error(y_true, y_prob, n_bins=15),
+        "brier_score": multiclass_brier_score(y_true, y_prob, n_classes=n_classes),
+        "negative_log_likelihood": negative_log_likelihood(y_true, y_prob),
     }
 
     return metrics, y_true, y_pred, y_prob
@@ -213,7 +330,29 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
 
 
 def main():
+    global OUTPUT_DIR, RANDOM_STATE
+
+    args = parse_args()
+    OUTPUT_DIR = Path(args.output_dir)
+    RANDOM_STATE = int(args.split_seed)
+
+    set_global_seed(seed=int(args.seed), deterministic=bool(args.deterministic))
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        "script": Path(__file__).name,
+        "seed": int(args.seed),
+        "split_seed": int(args.split_seed),
+        "output_dir": str(OUTPUT_DIR),
+        "deterministic": bool(args.deterministic),
+        "created_at": pd.Timestamp.utcnow().isoformat(),
+    }
+    (OUTPUT_DIR / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    print(f"Training seed: {args.seed}")
+    print(f"Split seed:    {args.split_seed}")
+    print(f"Output dir:    {OUTPUT_DIR}")
 
     print(f"Loading tensor dataset: {TENSOR_PATH}")
 
@@ -277,12 +416,16 @@ def main():
     val_dataset = HybridDataset(X_lc[val_idx], X_tab_val, y[val_idx])
     test_dataset = HybridDataset(X_lc[test_idx], X_tab_test, y[test_idx])
 
+    train_generator = torch.Generator()
+    train_generator.manual_seed(int(args.seed))
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=True,
+        generator=train_generator,
     )
 
     val_loader = DataLoader(
@@ -405,6 +548,8 @@ def main():
                     "n_channels": n_channels,
                     "n_tabular": n_tabular,
                     "n_classes": n_classes,
+                    "seed": int(args.seed),
+                    "split_seed": int(args.split_seed),
                 },
                 best_model_path,
             )
@@ -437,6 +582,11 @@ def main():
     print(f"Macro-F1:          {test_metrics['macro_f1']:.4f}")
     print(f"Weighted-F1:       {test_metrics['weighted_f1']:.4f}")
     print(f"Mean confidence:   {test_metrics['mean_confidence']:.4f}")
+    print(f"Top-3 accuracy:    {test_metrics['top3_accuracy']:.4f}")
+    print(f"Top-5 accuracy:    {test_metrics['top5_accuracy']:.4f}")
+    print(f"ECE:               {test_metrics['ece']:.4f}")
+    print(f"Brier score:       {test_metrics['brier_score']:.4f}")
+    print(f"NLL:               {test_metrics['negative_log_likelihood']:.4f}")
 
     label_to_name = load_label_names()
     labels = sorted(np.unique(y_true))
@@ -458,6 +608,8 @@ def main():
 
     pd.DataFrame([{
         "model": "hybrid_temporal_tabular_cnn",
+        "seed": int(args.seed),
+        "split_seed": int(args.split_seed),
         "n_objects": n_objects,
         "n_train": len(train_idx),
         "n_val": len(val_idx),
@@ -479,7 +631,7 @@ def main():
         "confidence": np.max(y_prob, axis=1),
     }).to_csv(OUTPUT_DIR / "hybrid_temporal_tabular_cnn_test_predictions.csv", index=False)
 
-    np.save(OUTPUT_DIR / "hybrid_temporal_tabular_cnn_test_probabilities.npy", y_prob)
+    np.save(OUTPUT_DIR / "hybrid_temporal_tabular_cnn_test_probabilities.npy", y_prob.astype(np.float32))
 
     print("\nSaved:")
     print(f"- {best_model_path}")

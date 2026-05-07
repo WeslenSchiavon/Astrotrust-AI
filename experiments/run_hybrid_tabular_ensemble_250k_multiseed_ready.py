@@ -1,5 +1,7 @@
 from pathlib import Path
 import time
+import argparse
+import random
 
 import numpy as np
 import pandas as pd
@@ -27,14 +29,14 @@ TENSOR_PATH = (
     / "temporal_tensor_v1_250000obj_64bins.npz"
 )
 
-HYBRID_PROBS_PATH = (
+DEFAULT_HYBRID_PROBS_PATH = (
     ROOT_DIR
     / "results"
     / "hybrid_temporal_tabular_cnn_250k"
     / "hybrid_temporal_tabular_cnn_test_probabilities.npy"
 )
 
-HYBRID_PREDS_PATH = (
+DEFAULT_HYBRID_PREDS_PATH = (
     ROOT_DIR
     / "results"
     / "hybrid_temporal_tabular_cnn_250k"
@@ -49,10 +51,57 @@ CLASS_COUNTS_PATH = (
     / "full_class_counts.csv"
 )
 
-OUTPUT_DIR = ROOT_DIR / "results" / "hybrid_tabular_ensemble_250k"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "results" / "hybrid_tabular_ensemble_250k"
+
+HYBRID_PROBS_PATH = DEFAULT_HYBRID_PROBS_PATH
+HYBRID_PREDS_PATH = DEFAULT_HYBRID_PREDS_PATH
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
 RANDOM_STATE = 42
+DEFAULT_SPLIT_SEED = 42
 TEST_SIZE = 0.25
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def top_k_accuracy(y_true, y_prob, k: int) -> float:
+    k = min(k, y_prob.shape[1])
+    topk = np.argpartition(-y_prob, kth=k - 1, axis=1)[:, :k]
+    return float(np.mean([yt in row for yt, row in zip(y_true, topk)]))
+
+
+def multiclass_brier_score(y_true, y_prob, n_classes: int) -> float:
+    y_onehot = np.zeros((len(y_true), n_classes), dtype=np.float32)
+    y_onehot[np.arange(len(y_true)), y_true.astype(int)] = 1.0
+    return float(np.mean(np.sum((y_prob - y_onehot) ** 2, axis=1)))
+
+
+def negative_log_likelihood(y_true, y_prob, eps: float = 1e-12) -> float:
+    probs = np.clip(y_prob[np.arange(len(y_true)), y_true.astype(int)], eps, 1.0)
+    return float(-np.mean(np.log(probs)))
+
+
+def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
+    confidences = np.max(y_prob, axis=1)
+    predictions = np.argmax(y_prob, axis=1)
+    correct = (predictions == y_true).astype(float)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (confidences >= lo) & (confidences <= hi)
+        else:
+            mask = (confidences >= lo) & (confidences < hi)
+        if not np.any(mask):
+            continue
+        bin_acc = float(np.mean(correct[mask]))
+        bin_conf = float(np.mean(confidences[mask]))
+        ece += float(np.mean(mask)) * abs(bin_acc - bin_conf)
+    return float(ece)
 
 
 def load_label_names():
@@ -157,6 +206,12 @@ def evaluate_probabilities(name, y_true, probabilities, all_classes):
     macro_f1 = f1_score(y_true, y_pred, average="macro")
     weighted_f1 = f1_score(y_true, y_pred, average="weighted")
     mean_confidence = float(np.max(probabilities, axis=1).mean())
+    top2 = top_k_accuracy(y_true, probabilities, 2)
+    top3 = top_k_accuracy(y_true, probabilities, 3)
+    top5 = top_k_accuracy(y_true, probabilities, 5)
+    ece = expected_calibration_error(y_true, probabilities, n_bins=15)
+    brier = multiclass_brier_score(y_true, probabilities, n_classes=len(all_classes))
+    nll = negative_log_likelihood(y_true, probabilities)
 
     print("\n" + "=" * 80)
     print(f"Results: {name}")
@@ -164,7 +219,12 @@ def evaluate_probabilities(name, y_true, probabilities, all_classes):
     print(f"Balanced accuracy: {balanced_acc:.4f}")
     print(f"Macro-F1:          {macro_f1:.4f}")
     print(f"Weighted-F1:       {weighted_f1:.4f}")
+    print(f"Top-3 accuracy:    {top3:.4f}")
+    print(f"Top-5 accuracy:    {top5:.4f}")
     print(f"Mean confidence:   {mean_confidence:.4f}")
+    print(f"ECE:               {ece:.4f}")
+    print(f"Brier score:       {brier:.4f}")
+    print(f"NLL:               {nll:.4f}")
 
     return {
         "model": name,
@@ -172,7 +232,13 @@ def evaluate_probabilities(name, y_true, probabilities, all_classes):
         "balanced_accuracy": balanced_acc,
         "macro_f1": macro_f1,
         "weighted_f1": weighted_f1,
+        "top2_accuracy": top2,
+        "top3_accuracy": top3,
+        "top5_accuracy": top5,
         "mean_confidence": mean_confidence,
+        "ece": ece,
+        "brier_score": brier,
+        "negative_log_likelihood": nll,
     }, y_pred
 
 
@@ -203,6 +269,10 @@ def train_predict_proba(name, model, X_train, X_test, y_train, all_classes):
     )
 
     return probabilities, elapsed / 60
+
+
+def save_metrics(name, metrics):
+    pd.DataFrame([metrics]).to_csv(OUTPUT_DIR / f"{name}_test_metrics.csv", index=False)
 
 
 def save_report(name, y_true, y_pred):
@@ -267,8 +337,42 @@ def check_hybrid_alignment(object_ids_test, y_test):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run hybrid + tabular ensemble with multi-seed support.")
+    parser.add_argument("--seed", type=int, default=42, help="Training random seed for tabular members.")
+    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED, help="Fixed split seed for train/test alignment.")
+    parser.add_argument("--input-root", type=Path, default=None, help="Seed-specific root directory containing hybrid outputs.")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory where outputs are saved.")
+    parser.add_argument("--hybrid-probs", type=Path, default=None, help="Optional path to hybrid test probabilities.")
+    parser.add_argument("--hybrid-preds", type=Path, default=None, help="Optional path to hybrid test predictions CSV.")
+    args = parser.parse_args()
+
+    global OUTPUT_DIR, HYBRID_PROBS_PATH, HYBRID_PREDS_PATH, RANDOM_STATE
+    RANDOM_STATE = int(args.seed)
+    OUTPUT_DIR = Path(args.output_dir)
+
+    if args.hybrid_probs is not None:
+        HYBRID_PROBS_PATH = Path(args.hybrid_probs)
+    elif args.input_root is not None:
+        HYBRID_PROBS_PATH = Path(args.input_root) / "hybrid_temporal_tabular_cnn" / "hybrid_temporal_tabular_cnn_test_probabilities.npy"
+    else:
+        HYBRID_PROBS_PATH = DEFAULT_HYBRID_PROBS_PATH
+
+    if args.hybrid_preds is not None:
+        HYBRID_PREDS_PATH = Path(args.hybrid_preds)
+    elif args.input_root is not None:
+        HYBRID_PREDS_PATH = Path(args.input_root) / "hybrid_temporal_tabular_cnn" / "hybrid_temporal_tabular_cnn_test_predictions.csv"
+    else:
+        HYBRID_PREDS_PATH = DEFAULT_HYBRID_PREDS_PATH
+
+    set_global_seed(args.seed)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    print(f"Training seed: {args.seed}")
+    print(f"Split seed:    {args.split_seed}")
+    print(f"Input root:    {args.input_root}")
+    print(f"Output dir:    {OUTPUT_DIR}")
+    print(f"Hybrid probs:  {HYBRID_PROBS_PATH}")
+    print(f"Hybrid preds:  {HYBRID_PREDS_PATH}")
     print(f"Loading tensor dataset: {TENSOR_PATH}")
 
     X_tab, y, object_ids = load_tensor_dataset()
@@ -284,7 +388,7 @@ def main():
     train_idx, test_idx = train_test_split(
         np.arange(len(y)),
         test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
+        random_state=args.split_seed,
         stratify=y,
     )
 
@@ -330,6 +434,7 @@ def main():
         all_classes=all_classes,
     )
     results.append(metrics)
+    save_metrics("hybrid_cnn_tabular", metrics)
     save_predictions("hybrid_cnn_tabular", object_ids_test, y_test, y_pred, hybrid_probs)
     save_probabilities("hybrid_cnn_tabular", hybrid_probs)
     save_report("hybrid_cnn_tabular", y_test, y_pred)
@@ -362,6 +467,7 @@ def main():
         metrics["training_time_minutes"] = train_time
         results.append(metrics)
 
+        save_metrics(name, metrics)
         save_predictions(name, object_ids_test, y_test, y_pred, probs)
         save_probabilities(name, probs)
         save_report(name, y_test, y_pred)
@@ -439,6 +545,7 @@ def main():
         metrics["weights"] = ",".join([f"{k}:{v}" for k, v in weights.items()])
         results.append(metrics)
 
+        save_metrics(ensemble_name, metrics)
         save_predictions(ensemble_name, object_ids_test, y_test, y_pred, probs)
         save_probabilities(ensemble_name, probs)
         save_report(ensemble_name, y_test, y_pred)
@@ -449,12 +556,32 @@ def main():
     output_path = OUTPUT_DIR / "hybrid_tabular_ensemble_comparison_250k.csv"
     results_df.to_csv(output_path, index=False)
 
+    # Save the configured final model in an unambiguous file. The multi-seed
+    # orchestrator prioritizes files containing the model directory name, so
+    # this prevents it from summarizing a member model such as xgboost_gpu_deeper.
+    final_model_name = "ensemble_hybrid_dominant"
+    final_rows = results_df.loc[results_df["model"] == final_model_name].copy()
+    if final_rows.empty:
+        raise RuntimeError(f"Could not find {final_model_name} in ensemble results.")
+
+    final_metrics_path = OUTPUT_DIR / f"{final_model_name}_test_metrics.csv"
+    final_rows.to_csv(final_metrics_path, index=False)
+
+    # Alias used for quick manual inspection.
+    selected_metrics_path = OUTPUT_DIR / "final_selected_ensemble_test_metrics.csv"
+    final_rows.to_csv(selected_metrics_path, index=False)
+
     print("\n" + "=" * 80)
     print("Hybrid + tabular ensemble comparison:")
     print(results_df)
 
+    print("\nFinal selected ensemble metrics:")
+    print(final_rows.to_string(index=False))
+
     print("\nSaved:")
     print(f"- {output_path}")
+    print(f"- {final_metrics_path}")
+    print(f"- {selected_metrics_path}")
 
 
 if __name__ == "__main__":
