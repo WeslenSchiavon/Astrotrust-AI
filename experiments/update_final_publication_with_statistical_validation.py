@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
+r"""
 update_final_publication_with_statistical_validation.py
 
 Consolida os testes estatísticos finais do AstroTrust-AI em:
@@ -14,9 +14,7 @@ Este script NÃO recalcula métricas. Ele apenas:
 3. insere/substitui uma seção marcada no final_publication_summary.md.
 
 Uso recomendado:
-python .\experiments\update_final_publication_with_statistical_validation.py `
-  --stats-dir results\publication_strength_tests_250k_final `
-  --final-publication-dir results\final_publication
+python ./experiments/update_final_publication_with_statistical_validation.py --stats-dir results/publication_strength_tests_250k_final --final-publication-dir results/final_publication
 """
 
 from __future__ import annotations
