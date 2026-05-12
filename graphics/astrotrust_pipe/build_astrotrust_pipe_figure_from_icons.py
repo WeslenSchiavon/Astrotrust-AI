@@ -25,10 +25,15 @@ Default output:
 
 from __future__ import annotations
 
+import io
 import math
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
@@ -271,6 +276,76 @@ def paste_icon(
     canvas.alpha_composite(icon, (x, y))
 
 
+
+
+def make_light_curve_plot(width: int = 246, height: int = 136, dpi: int = 180) -> Image.Image:
+    """Generate the card-1 light-curve plot using the same model/style
+    adopted in plot_astrotrust_ai_conceptual_pipeline.py.
+
+    This is a real Matplotlib chart generated at runtime, not a static icon.
+    It uses deterministic synthetic multi-band observations for g/r filters,
+    with an inverted magnitude axis, points, connecting lines, grid, labels,
+    and a compact legend.
+    """
+    rng = np.random.default_rng(7)
+    t = np.linspace(0, 80, 24)
+
+    # Same synthetic transient model used in the conceptual-pipeline script.
+    mag_g = 20.1 - 1.0 * np.exp(-((t - 32) ** 2) / 180) + 0.08 * rng.normal(size=t.size)
+    mag_r = 20.4 - 0.8 * np.exp(-((t - 36) ** 2) / 220) + 0.08 * rng.normal(size=t.size)
+
+    fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="white")
+    ax = fig.add_axes([0.24, 0.24, 0.68, 0.66])
+
+    ax.scatter(
+        t,
+        mag_g,
+        s=6,
+        marker="o",
+        edgecolor="#587af7",
+        facecolor="white",
+        linewidth=0.85,
+        label="g",
+        zorder=3,
+    )
+    ax.scatter(
+        t + 1.0,
+        mag_r,
+        s=6,
+        marker="s",
+        edgecolor="#fd885d",
+        facecolor="white",
+        linewidth=0.85,
+        label="r",
+        zorder=3,
+    )
+    ax.plot(t, mag_g, color="#93C5FD", linewidth=0.95, zorder=2)
+    ax.plot(t + 1.0, mag_r, color="#FCD34D", linewidth=0.95, zorder=2)
+
+    # mais marcas no eixo X
+    ax.set_xticks(np.arange(0, 81, 20))   # 0, 10, 20, ..., 80
+
+    # mais marcas no eixo Y
+    ax.set_yticks(np.arange(19.0, 20.6, 0.5))
+    ax.set_xlabel("Time (MJD)", fontsize=5, labelpad=1)
+    ax.set_ylabel("Mag", fontsize=5, labelpad=1)
+    ax.tick_params(axis="both", labelsize=6.4, length=2, width=0.55, pad=1.2)
+    ax.invert_yaxis()
+    ax.grid(alpha=0.18, linewidth=0.5)
+    ax.legend(frameon=False, fontsize=6.4, loc="upper right", handlelength=1.1, borderpad=0.1)
+    ax.spines[["top", "right"]].set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.6)
+        spine.set_color("#7f8491")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor="white", transparent=False)
+    plt.close(fig)
+    buf.seek(0)
+
+    return Image.open(buf).convert("RGBA")
+
+
 # ============================================================
 # Figure geometry
 # ============================================================
@@ -345,7 +420,21 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         BOX_TEXT,
         spacing=8,
     )
-    paste_icon(canvas, asset_root, "06_light_curve_plot", 76, 379, use_transparent=False)
+    # Real generated plot, not a static icon/crop.
+   # Card 1 geometry
+    box_x1, box_y1, box_x2, box_y2 = BOXES_TOP[1]
+
+    # Light-curve plot position inside card 1
+    plot_x = box_x1 + 1
+    plot_y = box_y1 + 150
+    plot_w = 246 * 1.2
+    plot_h = 136 * 1.4
+
+    canvas.alpha_composite(
+        make_light_curve_plot(width=plot_w, height=plot_h),
+        (plot_x, plot_y)
+    )
+    rounded_box(draw, BOXES_TOP[1], outline=outline_colors[1], width=2, radius=16)
 
     # 2. Representation building
     paste_icon(canvas, asset_root, "02_step_badge_2", 382, 216, use_transparent=True)
@@ -386,6 +475,17 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         spacing=8,
     )
     dotted_hline(draw, 723, 973, 375, MID_BLUE, width=2)
+
+    # Probability expression above the bar chart
+    prob_font = get_font(17, italic=True)
+
+    draw.text(
+        (733, 405),
+        "p(class | light-curve, features)",
+        font=prob_font,
+        fill=BOX_TEXT,
+    )
+
     paste_icon(canvas, asset_root, "10_probability_vector_icon", 731, 457, use_transparent=False)
 
     # 4. Calibration and reliability
@@ -415,19 +515,29 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         spacing=7,
     )
     dotted_hline(draw, 1360, 1589, 375, ORANGE_LIGHT, width=2)
-    paste_icon(canvas, asset_root, "12_broker_priority_bars_only", 1360, 392, use_transparent=False)
+    paste_icon(canvas, asset_root, "12_broker_priority_bars_only", 1360 - 15, 392, use_transparent=False)
 
-    for name, pos in [
-        ("13_topk_target_icon", (1366, 498)),
-        ("14_confidence_shield_icon", (1418, 498)),
-        ("15_novelty_search_icon", (1466, 498)),
-        ("16_rarity_diamond_icon", (1516, 498)),
-        ("17_priority_star_icon", (1566, 498)),
-    ]:
-        paste_icon(canvas, asset_root, name, pos[0], pos[1], use_transparent=True)
+    icon_items = [
+        ("13_topk_target_icon", 1366, 498, "top-k"),
+        ("14_confidence_shield_icon", 1418, 498, "conf."),
+        ("15_novelty_search_icon", 1466, 498, "nov."),
+        ("16_rarity_diamond_icon", 1516, 498, "rar."),
+        ("17_priority_star_icon", 1566, 498, "prio."),
+    ]
 
-    for txt, xx in [("top-k", 1365), ("conf.", 1411), ("nov.", 1464), ("rar.", 1513), ("prio.", 1561)]:
-        draw.text((xx, 534), txt, font=BROKER_SMALL_FONT, fill=BOX_TEXT)
+    icon_w = 28   # ajuste se necessário
+    label_y = 530
+    x_offset = -5   # move tudo para a direita
+
+    for icon_name, icon_x, icon_y, label in icon_items:
+        new_x = icon_x + x_offset
+        paste_icon(canvas, asset_root, icon_name, new_x, icon_y, use_transparent=True)
+
+        icon_center_x = new_x + icon_w / 2
+        center_text(draw, icon_center_x, label_y, label, BROKER_SMALL_FONT, BOX_TEXT)
+
+    # redesenha a borda da caixa 5 por cima de tudo
+    rounded_box(draw, BOXES_TOP[5], outline=ORANGE_LIGHT, width=2, radius=16)
 
     # Solid arrows between pipeline cards
     arrow(draw, (333, 379), (366, 379), color=NAVY, width=2)
