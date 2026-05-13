@@ -119,22 +119,29 @@ def _font_candidates(bold: bool = False, italic: bool = False) -> Iterable[str]:
 
 
 def get_font(size: int, bold: bool = False, italic: bool = False) -> ImageFont.FreeTypeFont:
-    for path in _font_candidates(bold=bold, italic=italic):
-        p = Path(path)
-        if p.exists():
-            return ImageFont.truetype(str(p), size=size)
-    return ImageFont.load_default()
+    if bold and italic:
+        path = "C:/Windows/Fonts/timesbi.ttf"
+    elif bold:
+        path = "C:/Windows/Fonts/timesbd.ttf"
+    elif italic:
+        path = "C:/Windows/Fonts/timesi.ttf"
+    else:
+        path = "C:/Windows/Fonts/times.ttf"
 
+    if Path(path).exists():
+        return ImageFont.truetype(path, size=size)
+
+    return ImageFont.load_default()
 
 # Typography calibrated for 1672 x 941 px
 TITLE_FONT = get_font(38, bold=True)
 SUBTITLE_FONT = get_font(20)
 SECTION_FONT = get_font(18, bold=True)
 STEP_TITLE_FONT = get_font(20, bold=True)
-BODY_FONT = get_font(15)
-BODY_BIG_FONT = get_font(15)
-LOWER_TITLE_FONT = get_font(21, bold=True)
-LOWER_BODY_FONT = get_font(15)
+BODY_FONT = get_font(20)
+BODY_BIG_FONT = get_font(17)
+LOWER_TITLE_FONT = get_font(25, bold=True)
+LOWER_BODY_FONT = get_font(20)
 BROKER_SMALL_FONT = get_font(14)
 CAPTION_FONT = get_font(17, italic=True)
 PLUS_FONT = get_font(24, bold=True)
@@ -297,30 +304,36 @@ def make_light_curve_plot(width: int = 246, height: int = 136, dpi: int = 180) -
     fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="white")
     ax = fig.add_axes([0.24, 0.24, 0.68, 0.66])
 
-    ax.scatter(
+    
+    # Banda g
+    ax.plot(
         t,
         mag_g,
-        s=6,
+        color="#2563EB",
+        linewidth=0.5,
         marker="o",
-        edgecolor="#587af7",
-        facecolor="white",
-        linewidth=0.85,
+        markersize=2.8,
+        markerfacecolor="white",
+        markeredgecolor="#2563EB",
+        markeredgewidth=0.85,
         label="g",
         zorder=3,
     )
-    ax.scatter(
+
+    # Banda r
+    ax.plot(
         t + 1.0,
         mag_r,
-        s=6,
+        color="#F97316",
+        linewidth=0.5,
         marker="s",
-        edgecolor="#fd885d",
-        facecolor="white",
-        linewidth=0.85,
+        markersize=2.5,
+        markerfacecolor="white",
+        markeredgecolor="#F97316",
+        markeredgewidth=0.85,
         label="r",
         zorder=3,
     )
-    ax.plot(t, mag_g, color="#93C5FD", linewidth=0.95, zorder=2)
-    ax.plot(t + 1.0, mag_r, color="#FCD34D", linewidth=0.95, zorder=2)
 
     # mais marcas no eixo X
     ax.set_xticks(np.arange(0, 81, 20))   # 0, 10, 20, ..., 80
@@ -332,8 +345,20 @@ def make_light_curve_plot(width: int = 246, height: int = 136, dpi: int = 180) -
     ax.tick_params(axis="both", labelsize=6.4, length=2, width=0.55, pad=1.2)
     ax.invert_yaxis()
     ax.grid(alpha=0.18, linewidth=0.5)
-    ax.legend(frameon=False, fontsize=6.4, loc="upper right", handlelength=1.1, borderpad=0.1)
-    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(
+        frameon=False,
+        fontsize=5,
+        loc="upper right",
+        handlelength=1.6,
+        markerscale=1.0,
+        borderpad=0.1,
+        labelspacing=0.35,
+    )
+   # Borda externa completa do gráfico
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.8)
+        spine.set_color("#9CA3AF")
     for spine in ax.spines.values():
         spine.set_linewidth(0.6)
         spine.set_color("#7f8491")
@@ -425,9 +450,9 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
     box_x1, box_y1, box_x2, box_y2 = BOXES_TOP[1]
 
     # Light-curve plot position inside card 1
-    plot_x = box_x1 + 1
+    plot_x = box_x1 - 10
     plot_y = box_y1 + 150
-    plot_w = 246 * 1.2
+    plot_w = 246 * 1.3
     plot_h = 136 * 1.4
 
     canvas.alpha_composite(
@@ -448,9 +473,15 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         spacing=8,
     )
     dotted_hline(draw, 388, 656, 375, LIGHT_TEAL, width=2)
+    # Caixa 2
+    box_x1, box_y1, box_x2, box_y2 = BOXES_TOP[2]
+
+    # Centro horizontal da caixa
+    text_center_x = (box_x1 + box_x2) / 2
+
     center_text(
         draw,
-        545,
+        text_center_x,
         393,
         "Temporal branch\n+ tabular branch\n→ hybrid representation",
         BODY_BIG_FONT,
@@ -489,8 +520,8 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
     paste_icon(canvas, asset_root, "10_probability_vector_icon", 731, 457, use_transparent=False)
 
     # 4. Calibration and reliability
-    paste_icon(canvas, asset_root, "04_step_badge_4", 1049, 216, use_transparent=True)
-    draw_multiline(draw, (1100, 224), "Calibration and\nreliability layer", STEP_TITLE_FONT, PURPLE, spacing=2)
+    paste_icon(canvas, asset_root, "04_step_badge_4", 1040, 220, use_transparent=True)
+    draw_multiline(draw, (1095, 224), "Calibration and\nreliability layer", STEP_TITLE_FONT, PURPLE, spacing=2)
     draw_multiline(
         draw,
         (1055, 275),
@@ -499,18 +530,33 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         BOX_TEXT,
         spacing=8,
     )
+    # Caixa 4
+    box_x1, box_y1, box_x2, box_y2 = BOXES_TOP[4]
+
+    # Centro horizontal da caixa
+    box_center_x = (box_x1 + box_x2) / 2
+
     dotted_hline(draw, 1054, 1275, 375, LIGHT_PURPLE, width=2)
-    paste_icon(canvas, asset_root, "11_calibration_shield_icon", 1124, 391, use_transparent=True)
-    center_text(draw, 1162, 496, "Calibrated confidence\n+ uncertainty", BODY_BIG_FONT, PURPLE, spacing=5)
+    paste_icon(canvas, asset_root, "11_calibration_shield_icon", 1115, 391, use_transparent=True)
+
+    center_text(
+        draw,
+        box_center_x,
+        496,
+        "Calibrated confidence\n+ uncertainty",
+        BODY_BIG_FONT,
+        PURPLE,
+        spacing=5,
+    )
 
     # 5. Broker-like decision support
-    paste_icon(canvas, asset_root, "05_step_badge_5", 1362, 216, use_transparent=True)
-    draw_multiline(draw, (1403, 224), "Broker-like decision\nsupport", STEP_TITLE_FONT, ORANGE, spacing=2)
+    paste_icon(canvas, asset_root, "05_step_badge_5", 1350, 225, use_transparent=True)
+    draw_multiline(draw, (1400, 224), "Broker-like decision\nsupport", STEP_TITLE_FONT, ORANGE, spacing=2)
     draw_multiline(
         draw,
         (1360, 275),
         "• Top-k classes + calibrated confidence\n• Novelty + rarity signals\n• Priority score + follow-up\n  recommendation",
-        BODY_BIG_FONT,
+        get_font(15),
         BOX_TEXT,
         spacing=7,
     )
@@ -518,11 +564,11 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
     paste_icon(canvas, asset_root, "12_broker_priority_bars_only", 1360 - 15, 392, use_transparent=False)
 
     icon_items = [
-        ("13_topk_target_icon", 1366, 498, "top-k"),
-        ("14_confidence_shield_icon", 1418, 498, "conf."),
-        ("15_novelty_search_icon", 1466, 498, "nov."),
-        ("16_rarity_diamond_icon", 1516, 498, "rar."),
-        ("17_priority_star_icon", 1566, 498, "prio."),
+        ("13_topk_target_icon", 1362, 498, "top-k"),
+        ("14_confidence_shield_icon", 1416, 498, "conf."),
+        ("15_novelty_search_icon", 1468, 498, "nov."),
+        ("16_rarity_diamond_icon", 1519, 498, "rar."),
+        ("17_priority_star_icon", 1573, 498, "prio."),
     ]
 
     icon_w = 28   # ajuste se necessário
@@ -562,7 +608,7 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         "class confidence.",
         LOWER_BODY_FONT,
         BOX_TEXT,
-        spacing=7,
+        spacing=5,
     )
 
     paste_icon(canvas, asset_root, "19_operational_trust_shield_icon", 624, 651, use_transparent=True)
@@ -578,11 +624,11 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         "distribution inputs.",
         LOWER_BODY_FONT,
         BOX_TEXT,
-        spacing=7,
+        spacing=5,
     )
 
     paste_icon(canvas, asset_root, "20_actionable_clipboard_icon", 1132, 651, use_transparent=True)
-    draw.text((1245, 658), "Actionable output", font=LOWER_TITLE_FONT, fill=PURPLE)
+    draw.text((1295, 658), "Actionable output", font=LOWER_TITLE_FONT, fill=PURPLE)
     draw_multiline(
         draw,
         (1245, 693),
@@ -594,7 +640,7 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
         "not raw classification only.",
         LOWER_BODY_FONT,
         BOX_TEXT,
-        spacing=7,
+        spacing=5,
     )
 
     # Dashed interpretation connectors
