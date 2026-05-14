@@ -440,7 +440,7 @@ def build_figure(asset_root: Path, output_png: Path) -> None:
     draw_multiline(
         draw,
         (37, 275),
-        "• Multi-band light curve\n• Optional contextual metadata\n• Survey-ready transient candidate",
+        "• Multi-band light curve\n• Optional contextual metadata\n• Alert-like transient candidate",
         BODY_BIG_FONT,
         BOX_TEXT,
         spacing=8,
