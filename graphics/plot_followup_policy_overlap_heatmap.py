@@ -57,7 +57,7 @@ POLICY_ORDER = [
 
 POLICY_LABELS = {
     "rarity_only": "Rarity only",
-    "uncertainty_novelty_rarity": "Uncertainty + Novelty + Rarity",
+    "uncertainty_novelty_rarity": "Uncertainty + \nNovelty + Rarity",
     "novelty_only": "Novelty only",
     "random": "Random",
 }
