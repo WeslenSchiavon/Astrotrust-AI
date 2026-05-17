@@ -4,20 +4,27 @@
 """
 Generate a publication-quality rare-class enrichment figure by follow-up budget.
 
+Official source:
+  - Clean ensemble follow-up policy ablation
+  - final ensemble_hybrid_dominant probabilities
+  - explicit rare-class labels
+  - independent robust feature-space novelty score
+
 Figure:
   - x-axis: follow-up budget (%)
   - y-axis: rare-class enrichment
-  - one line per policy:
-      * Novelty + Rarity
+  - clean policies only:
       * Rarity only
-      * Previous discovery
-      * Fixed discovery
-  - shaded bands: 95% confidence intervals
+      * Novelty + Rarity
+      * Uncertainty + Novelty + Rarity
+      * Novelty only
+      * Random
+  - shaded bands: 95% bootstrap confidence intervals
 
 Output:
   results/final_publication/figures/fig_rare_class_enrichment_by_budget.png
 
-Run from any location:
+Run:
   python experiments/plot_rare_class_enrichment_by_budget.py
 """
 
@@ -36,33 +43,40 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def build_dataframe() -> pd.DataFrame:
-    """Fixed final values from the publication summary."""
+    """Official clean ensemble follow-up values from the final publication package."""
     rows = [
         # budget_pct, policy, enrichment, ci_low, ci_high
-        (1,  "novelty_rarity",     5.51548, 5.45462, 5.57411),
-        (2,  "novelty_rarity",     5.35333, 5.27840, 5.41685),
-        (5,  "novelty_rarity",     5.18544, 5.13436, 5.24008),
-        (10, "novelty_rarity",     5.33963, 5.30877, 5.36934),
-        (20, "novelty_rarity",     4.74988, 4.71319, 4.78900),
+        (1,  "random",                     1.050100, 0.873449, 1.246380),
+        (2,  "random",                     1.099170, 0.961775, 1.217060),
+        (5,  "random",                     1.011550, 0.932986, 1.086190),
+        (10, "random",                     0.989948, 0.938854, 1.046910),
+        (20, "random",                     0.984546, 0.941801, 1.020400),
 
-        (1,  "rarity_only",        5.50567, 5.44040, 5.56364),
-        (2,  "rarity_only",        5.31404, 5.24094, 5.38421),
-        (5,  "rarity_only",        5.21490, 5.16233, 5.26560),
-        (10, "rarity_only",        5.34748, 5.31636, 5.38046),
-        (20, "rarity_only",        4.75725, 4.72011, 4.79487),
+        (1,  "rarity_only",                5.603810, 5.603810, 5.603810),
+        (2,  "rarity_only",                5.603810, 5.603810, 5.603810),
+        (5,  "rarity_only",                5.603810, 5.603810, 5.603810),
+        (10, "rarity_only",                5.600860, 5.597920, 5.603810),
+        (20, "rarity_only",                4.899650, 4.825990, 4.978230),
 
-        (1,  "previous_discovery", 4.34761, 4.16328, 4.53076),
-        (2,  "previous_discovery", 3.48212, 3.33338, 3.63705),
-        (5,  "previous_discovery", 2.22345, 2.13131, 2.32060),
-        (10, "previous_discovery", 2.14096, 2.06666, 2.21454),
-        (20, "previous_discovery", 2.42871, 2.37851, 2.47926),
+        (1,  "novelty_only",               1.030470, 0.853821, 1.216940),
+        (2,  "novelty_only",               1.050100, 0.927426, 1.187500),
+        (5,  "novelty_only",               0.997804, 0.917273, 1.074460),
+        (10, "novelty_only",               0.909416, 0.857365, 0.966402),
+        (20, "novelty_only",               0.850000, 0.814141, 0.886853),
 
-        (1,  "fixed_discovery",    0.765494, 0.612580, 0.922786),
-        (2,  "fixed_discovery",    0.540245, 0.452677, 0.631447),
-        (5,  "fixed_discovery",    0.388908, 0.337892, 0.436691),
-        (10, "fixed_discovery",    0.430156, 0.394471, 0.468333),
-        (20, "fixed_discovery",    0.672732, 0.639637, 0.705510),
+        (1,  "novelty_rarity",             5.348650, 5.250510, 5.436970),
+        (2,  "novelty_rarity",             5.289760, 5.201440, 5.358460),
+        (5,  "novelty_rarity",             5.275790, 5.220800, 5.320970),
+        (10, "novelty_rarity",             5.128480, 5.087210, 5.168740),
+        (20, "novelty_rarity",             4.771490, 4.697790, 4.831400),
+
+        (1,  "uncertainty_novelty_rarity", 4.592970, 4.386870, 4.779430),
+        (2,  "uncertainty_novelty_rarity", 4.946270, 4.838320, 5.054230),
+        (5,  "uncertainty_novelty_rarity", 5.212940, 5.155980, 5.267940),
+        (10, "uncertainty_novelty_rarity", 5.127500, 5.086250, 5.170710),
+        (20, "uncertainty_novelty_rarity", 4.776400, 4.698800, 4.808330),
     ]
+
     return pd.DataFrame(
         rows,
         columns=["budget_pct", "policy", "rare_enrichment", "ci_low", "ci_high"],
@@ -80,7 +94,7 @@ def configure_style() -> None:
         "axes.titlesize": 10.8,
         "xtick.labelsize": 9,
         "ytick.labelsize": 9,
-        "legend.fontsize": 8.2,
+        "legend.fontsize": 8.0,
         "axes.linewidth": 0.8,
         "axes.spines.top": False,
         "axes.spines.right": False,
@@ -97,43 +111,56 @@ def plot_figure(df: pd.DataFrame) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "fig_rare_class_enrichment_by_budget.png"
 
-    fig, ax = plt.subplots(figsize=(7.9, 4.9))
+    fig, ax = plt.subplots(figsize=(8.15, 4.95))
 
     policy_order = [
-        "novelty_rarity",
         "rarity_only",
-        "previous_discovery",
-        "fixed_discovery",
+        "novelty_rarity",
+        "uncertainty_novelty_rarity",
+        "novelty_only",
+        "random",
     ]
 
     style = {
+        "rarity_only": {
+            "color": "#0072B2",
+            "marker": "s",
+            "label": "Rarity only",
+            "lw": 2.2,
+            "z": 6,
+            "ls": "-",
+        },
         "novelty_rarity": {
             "color": "#D55E00",
             "marker": "o",
             "label": "Novelty + Rarity",
             "lw": 2.3,
+            "z": 7,
+            "ls": "-",
+        },
+        "uncertainty_novelty_rarity": {
+            "color": "#6A3D9A",
+            "marker": "P",
+            "label": "Uncertainty + Novelty + Rarity",
+            "lw": 1.9,
             "z": 5,
+            "ls": "-",
         },
-        "rarity_only": {
-            "color": "#0072B2",
-            "marker": "s",
-            "label": "Rarity only",
-            "lw": 2.1,
-            "z": 4,
-        },
-        "previous_discovery": {
+        "novelty_only": {
             "color": "#009E73",
             "marker": "^",
-            "label": "Previous discovery",
-            "lw": 1.9,
-            "z": 3,
+            "label": "Novelty only",
+            "lw": 1.8,
+            "z": 4,
+            "ls": "-",
         },
-        "fixed_discovery": {
+        "random": {
             "color": "#7A7A7A",
             "marker": "D",
-            "label": "Fixed discovery",
-            "lw": 1.8,
-            "z": 2,
+            "label": "Random",
+            "lw": 1.6,
+            "z": 3,
+            "ls": "--",
         },
     }
 
@@ -146,7 +173,7 @@ def plot_figure(df: pd.DataFrame) -> Path:
             sub["ci_low"],
             sub["ci_high"],
             color=st["color"],
-            alpha=0.16,
+            alpha=0.12 if policy != "random" else 0.09,
             zorder=st["z"] - 1,
         )
 
@@ -155,40 +182,15 @@ def plot_figure(df: pd.DataFrame) -> Path:
             sub["rare_enrichment"],
             color=st["color"],
             marker=st["marker"],
-            markersize=6.2,
+            markersize=6.0,
             linewidth=st["lw"],
+            linestyle=st["ls"],
             markeredgecolor="white",
             markeredgewidth=0.8,
             label=st["label"],
             zorder=st["z"],
         )
 
-    ax.set_xlabel("Follow-up budget (%)")
-    ax.set_ylabel("Rare-class enrichment")
-    ax.set_title("Rare-class enrichment by follow-up budget", pad=20)
-
-    ax.set_xticks([1, 2, 5, 10, 20])
-    ax.set_xticklabels(["1%", "2%", "5%", "10%", "20%"])
-    ax.set_xlim(0.6, 20.7)
-    ax.set_ylim(0.0, 5.9)
-
-    ax.grid(axis="y", linewidth=0.5, alpha=0.28)
-    ax.grid(axis="x", linewidth=0.35, alpha=0.14)
-
-    ax.legend(
-        loc="lower left",
-        # O primeiro valor (0.02) é a distância da esquerda (x)
-        # O segundo valor (0.15) empurra a legenda para cima (y)
-        bbox_to_anchor=(0.02, 0.13), 
-        frameon=True,
-        framealpha=0.96,
-        edgecolor="#D0D0D0",
-        borderpad=0.75,
-        fontsize=8.2
-    )
-
-    # Random-selection baseline. Rare enrichment is expected to be approximately 1x
-    # under a random follow-up selection.
     ax.axhline(
         1.0,
         color="#333333",
@@ -198,12 +200,33 @@ def plot_figure(df: pd.DataFrame) -> Path:
         zorder=2,
     )
 
+    ax.set_xlabel("Follow-up budget (%)")
+    ax.set_ylabel("Rare-class enrichment")
+    ax.set_title("Rare-class enrichment by follow-up budget", pad=20)
+
+    ax.set_xticks([1, 2, 5, 10, 20])
+    ax.set_xticklabels(["1%", "2%", "5%", "10%", "20%"])
+    ax.set_xlim(0.6, 20.7)
+    ax.set_ylim(0.0, 6.05)
+
+    ax.grid(axis="y", linewidth=0.5, alpha=0.28)
+    ax.grid(axis="x", linewidth=0.35, alpha=0.14)
+
+    ax.legend(
+        loc="lower left",
+        bbox_to_anchor=(0.02, 0.20),
+        frameon=True,
+        framealpha=0.96,
+        edgecolor="#D0D0D0",
+        borderpad=0.75,
+        fontsize=7.9,
+    )
 
     ax.text(
         0.015,
         1.02,
-        "Novelty + rarity remains close to rarity only,\n"
-        "while explicitly incorporating novelty.",
+        "Clean ensemble follow-up ablation:\n"
+        "novelty + rarity keeps strong rare-class enrichment.",
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -219,7 +242,7 @@ def plot_figure(df: pd.DataFrame) -> Path:
 
     ax.text(
         20.55,
-        1.07,
+        1.15,
         "random expectation ≈ 1×",
         ha="right",
         va="bottom",
@@ -252,15 +275,12 @@ def plot_figure(df: pd.DataFrame) -> Path:
         ),
     )
 
-
-
-    # Highlight the central 5% result.
-    x_anno = 5
-    y_anno = 5.18544
     ax.annotate(
-        "At 5% budget:\nnovelty + rarity ≈ 5.19×",
-        xy=(x_anno, y_anno),
-        xytext=(8.2, 4.85),
+        "At 5% budget:\n"
+        "novelty + rarity ≈ 5.28×\n"
+        "rarity only ≈ 5.60×",
+        xy=(5, 5.275790),
+        xytext=(7.8, 4.55),
         textcoords="data",
         arrowprops=dict(
             arrowstyle="-|>",
@@ -268,6 +288,7 @@ def plot_figure(df: pd.DataFrame) -> Path:
             color="#333333",
             shrinkA=3,
             shrinkB=3,
+            zorder=12,
         ),
         bbox=dict(
             boxstyle="round,pad=0.32",
@@ -279,6 +300,7 @@ def plot_figure(df: pd.DataFrame) -> Path:
         fontsize=8.1,
         ha="left",
         va="center",
+        zorder=12,
     )
 
     fig.tight_layout()

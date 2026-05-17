@@ -6,6 +6,12 @@ Generate a publication-quality grouped bar chart for:
 
 Top-k fine vs. family-level performance with 95% bootstrap confidence intervals.
 
+Official source:
+  - ensemble_hybrid_dominant
+  - ensemble top-k/family bootstrap confidence intervals
+  - family-level top-k is computed by mapping fine-grained top-k classes to
+    astronomical families, not by summing probability mass by family.
+
 Figure:
   - x-axis: Top-1, Top-2, Top-3, Top-5
   - y-axis: Accuracy
@@ -17,7 +23,7 @@ Figure:
 Output:
   results/final_publication/figures/fig_topk_fine_vs_family_bootstrap.png
 
-Run from any location:
+Run:
   python experiments/plot_topk_fine_vs_family_bootstrap.py
 """
 
@@ -37,43 +43,43 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def build_dataframe() -> pd.DataFrame:
-    """Fixed final values from the publication summary."""
+    """Official ensemble values from the final publication summary."""
     rows = [
         {
             "k_label": "Top-1",
-            "fine": 0.673420,
-            "fine_ci_low": 0.669474,
-            "fine_ci_high": 0.677207,
-            "family": 0.831172,
-            "family_ci_low": 0.828069,
-            "family_ci_high": 0.834065,
+            "fine": 0.684163,
+            "fine_ci_low": 0.680290,
+            "fine_ci_high": 0.687671,
+            "family": 0.835904,
+            "family_ci_low": 0.832678,
+            "family_ci_high": 0.838726,
         },
         {
             "k_label": "Top-2",
-            "fine": 0.818290,
-            "fine_ci_low": 0.815433,
-            "fine_ci_high": 0.821534,
-            "family": 0.916646,
-            "family_ci_low": 0.914350,
-            "family_ci_high": 0.918960,
+            "fine": 0.823723,
+            "fine_ci_low": 0.820813,
+            "fine_ci_high": 0.826844,
+            "family": 0.919398,
+            "family_ci_low": 0.917101,
+            "family_ci_high": 0.921572,
         },
         {
             "k_label": "Top-3",
-            "fine": 0.886501,
-            "fine_ci_low": 0.883907,
-            "fine_ci_high": 0.889043,
-            "family": 0.955239,
-            "family_ci_low": 0.953591,
-            "family_ci_high": 0.956886,
+            "fine": 0.890147,
+            "fine_ci_low": 0.887518,
+            "fine_ci_high": 0.892741,
+            "family": 0.958709,
+            "family_ci_low": 0.957078,
+            "family_ci_high": 0.960374,
         },
         {
             "k_label": "Top-5",
-            "fine": 0.947019,
-            "fine_ci_low": 0.945266,
-            "fine_ci_high": 0.948842,
-            "family": 0.986260,
-            "family_ci_low": 0.985295,
-            "family_ci_high": 0.987206,
+            "fine": 0.948053,
+            "fine_ci_low": 0.946264,
+            "fine_ci_high": 0.949841,
+            "family": 0.987907,
+            "family_ci_low": 0.986978,
+            "family_ci_high": 0.988819,
         },
     ]
     return pd.DataFrame(rows)
@@ -187,7 +193,7 @@ def plot_figure(df: pd.DataFrame) -> Path:
     ax.text(
         0.985,
         1.13,
-        "Top-5:\nfine ≈ 0.9470\nfamily ≈ 0.9863",
+        "Top-5:\nfine ≈ 0.9481\nfamily ≈ 0.9879",
         transform=ax.transAxes,
         ha="right",
         va="top",

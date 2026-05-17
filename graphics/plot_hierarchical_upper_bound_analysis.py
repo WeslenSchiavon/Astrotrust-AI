@@ -1,6 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+"""
+Generate a publication-quality hierarchical upper-bound figure.
+
+Official source:
+  - final ensemble_hybrid_dominant hierarchical upper-bound analysis
+  - original_top1
+  - family_mass_then_subclass
+  - oracle_true_family_then_subclass
+
+Figure:
+  - Panel A: fine-grained accuracy
+  - Panel B: family-level accuracy
+  - Error bars: 95% bootstrap confidence intervals
+
+Output:
+  results/final_publication/figures/fig_hierarchical_upper_bound_analysis.png
+
+Run:
+  python experiments/plot_hierarchical_upper_bound_analysis.py
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,14 +37,38 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def build_data():
+    """Official ensemble hierarchical upper-bound values."""
     strategies = [
         "Original\ntop-1",
         "Family-mass\nthen subclass",
         "Oracle true family\nthen subclass",
     ]
-    fine_accuracy = [0.673, 0.669, 0.785]
-    family_accuracy = [0.827, 0.836, 1.000]
-    return strategies, fine_accuracy, family_accuracy
+
+    fine_accuracy = np.array([0.684163, 0.679677, 0.788864])
+    fine_ci_low = np.array([0.680290, 0.675627, 0.785499])
+    fine_ci_high = np.array([0.687671, 0.683603, 0.792143])
+
+    family_accuracy = np.array([0.835904, 0.845753, 1.000000])
+    family_ci_low = np.array([0.832959, 0.842598, 1.000000])
+    family_ci_high = np.array([0.838901, 0.848506, 1.000000])
+
+    deltas = {
+        "family_mass_fine_delta": -0.00448666,
+        "family_mass_family_delta": 0.00984963,
+        "oracle_fine_headroom": 0.104700,
+        "oracle_family_headroom": 0.164096,
+    }
+
+    return (
+        strategies,
+        fine_accuracy,
+        fine_ci_low,
+        fine_ci_high,
+        family_accuracy,
+        family_ci_low,
+        family_ci_high,
+        deltas,
+    )
 
 
 def configure_style() -> None:
@@ -45,11 +90,11 @@ def configure_style() -> None:
     })
 
 
-def add_bar_labels(ax, bars, values, offset=0.012):
+def add_bar_labels(ax, bars, values, offset=0.010):
     for bar, val in zip(bars, values):
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
-            min(val + offset, ax.get_ylim()[1] - 0.01),
+            min(val + offset, ax.get_ylim()[1] - 0.008),
             f"{val:.3f}",
             ha="center",
             va="bottom",
@@ -59,7 +104,22 @@ def add_bar_labels(ax, bars, values, offset=0.012):
         )
 
 
-def plot_figure(strategies, fine_accuracy, family_accuracy) -> Path:
+def make_yerr(values, ci_low, ci_high):
+    lower = values - ci_low
+    upper = ci_high - values
+    return np.vstack([lower, upper])
+
+
+def plot_figure(
+    strategies,
+    fine_accuracy,
+    fine_ci_low,
+    fine_ci_high,
+    family_accuracy,
+    family_ci_low,
+    family_ci_high,
+    deltas,
+) -> Path:
     configure_style()
 
     output_dir = ROOT_DIR / "results" / "final_publication" / "figures"
@@ -72,43 +132,54 @@ def plot_figure(strategies, fine_accuracy, family_accuracy) -> Path:
     edgecolors = ["#0A4C7A", "#2E7FA4", "#8C3B00"]
     x = np.arange(len(strategies))
 
-    # Panel A
+    # -------------------------
+    # Panel A: fine accuracy
+    # -------------------------
     ax = axes[0]
     bars_a = ax.bar(
-        x, fine_accuracy,
+        x,
+        fine_accuracy,
         color=colors,
         edgecolor=edgecolors,
         linewidth=0.9,
         width=0.62,
+        yerr=make_yerr(fine_accuracy, fine_ci_low, fine_ci_high),
+        ecolor="#222222",
+        capsize=4,
         zorder=3,
     )
+
     ax.set_title("A. Fine-grained accuracy", pad=10)
     ax.set_ylabel("Fine accuracy")
     ax.set_xticks(x)
     ax.set_xticklabels(strategies)
-    ax.set_ylim(0.60, 0.83)
+    ax.set_ylim(0.64, 0.815)
     ax.grid(axis="y", linewidth=0.5, alpha=0.28, zorder=1)
-    add_bar_labels(ax, bars_a, fine_accuracy, offset=0.008)
+    add_bar_labels(ax, bars_a, fine_accuracy, offset=0.007)
 
     ax.text(
-        0.02, 0.98,
-        "Simple hierarchical reranking\ndoes not improve fine accuracy.",
+        0.02,
+        0.98,
+        "Simple hierarchical reranking\ndoes not improve fine accuracy.\nError bars: 95% bootstrap CI",
         transform=ax.transAxes,
         ha="left",
         va="top",
         fontsize=8.0,
         bbox=dict(
             boxstyle="round,pad=0.28",
-            fc="white", ec="#D0D0D0", lw=0.7, alpha=0.96,
+            fc="white",
+            ec="#D0D0D0",
+            lw=0.7,
+            alpha=0.96,
         ),
         zorder=7,
     )
 
     ax.annotate(
-        "Family-mass reranking: -0.004",
+        f"Family-mass reranking: {deltas['family_mass_fine_delta']:+.4f}",
         xy=(x[1], fine_accuracy[1]),
         xycoords="data",
-        xytext=(0.18, 0.09),
+        xytext=(0.17, 0.17),
         textcoords=ax.transAxes,
         arrowprops=dict(
             arrowstyle="-|>",
@@ -132,10 +203,10 @@ def plot_figure(strategies, fine_accuracy, family_accuracy) -> Path:
     )
 
     ax.annotate(
-        "Oracle headroom: +0.112",
+        f"Oracle headroom: +{deltas['oracle_fine_headroom']:.4f}",
         xy=(x[2], fine_accuracy[2]),
         xycoords="data",
-        xytext=(0.60, 0.67),
+        xytext=(0.58, 0.64),
         textcoords=ax.transAxes,
         arrowprops=dict(
             arrowstyle="-|>",
@@ -158,36 +229,74 @@ def plot_figure(strategies, fine_accuracy, family_accuracy) -> Path:
         zorder=8,
     )
 
-    # Panel B
+    # -------------------------
+    # Panel B: family accuracy
+    # -------------------------
     ax = axes[1]
     bars_b = ax.bar(
-        x, family_accuracy,
+        x,
+        family_accuracy,
         color=colors,
         edgecolor=edgecolors,
         linewidth=0.9,
         width=0.62,
+        yerr=make_yerr(family_accuracy, family_ci_low, family_ci_high),
+        ecolor="#222222",
+        capsize=4,
         zorder=3,
     )
+
     ax.set_title("B. Family-level accuracy", pad=10)
     ax.set_ylabel("Family accuracy")
     ax.set_xticks(x)
     ax.set_xticklabels(strategies)
-    ax.set_ylim(0.75, 1.04)
+    ax.set_ylim(0.80, 1.035)
     ax.grid(axis="y", linewidth=0.5, alpha=0.28, zorder=1)
-    add_bar_labels(ax, bars_b, family_accuracy, offset=0.010)
+    add_bar_labels(ax, bars_b, family_accuracy, offset=0.009)
 
     ax.text(
-        0.02, 0.98,
-        "The oracle scenario reveals substantial headroom\nif astronomical family modeling is improved.",
+        0.02,
+        0.98,
+        "Family-mass reranking improves family accuracy,\nwhile the oracle reveals remaining headroom.",
         transform=ax.transAxes,
         ha="left",
         va="top",
         fontsize=8.0,
         bbox=dict(
             boxstyle="round,pad=0.28",
-            fc="white", ec="#D0D0D0", lw=0.7, alpha=0.96,
+            fc="white",
+            ec="#D0D0D0",
+            lw=0.7,
+            alpha=0.96,
         ),
         zorder=7,
+    )
+
+    ax.annotate(
+        f"Family-mass gain: +{deltas['family_mass_family_delta']:.4f}",
+        xy=(x[1], family_accuracy[1]),
+        xycoords="data",
+        xytext=(0.40, 0.12),
+        textcoords=ax.transAxes,
+        arrowprops=dict(
+            arrowstyle="-|>",
+            lw=0.8,
+            color="#333333",
+            shrinkA=3,
+            shrinkB=3,
+            connectionstyle="arc3,rad=0.10",
+        ),
+        bbox=dict(
+            boxstyle="round,pad=0.28",
+            fc="white",
+            ec="#CFCFCF",
+            lw=0.7,
+            alpha=0.97,
+        ),
+        fontsize=7.9,
+        ha="left",
+        va="center",
+        zorder=8,
     )
 
     fig.suptitle("Hierarchical upper-bound analysis", fontsize=12.5, y=1.05)
@@ -197,8 +306,27 @@ def plot_figure(strategies, fine_accuracy, family_accuracy) -> Path:
 
 
 def main() -> None:
-    strategies, fine_accuracy, family_accuracy = build_data()
-    output_path = plot_figure(strategies, fine_accuracy, family_accuracy)
+    (
+        strategies,
+        fine_accuracy,
+        fine_ci_low,
+        fine_ci_high,
+        family_accuracy,
+        family_ci_low,
+        family_ci_high,
+        deltas,
+    ) = build_data()
+
+    output_path = plot_figure(
+        strategies,
+        fine_accuracy,
+        fine_ci_low,
+        fine_ci_high,
+        family_accuracy,
+        family_ci_low,
+        family_ci_high,
+        deltas,
+    )
     print(f"[OK] Figure saved to: {output_path}")
 
 
