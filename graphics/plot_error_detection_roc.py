@@ -191,7 +191,7 @@ def plot_figure() -> Path:
     )
 
     ax.text(
-        0.54,
+        0.3,
         0.19,
         "Higher uncertainty effectively identifies likely incorrect predictions.",
         transform=ax.transAxes,
