@@ -176,6 +176,5 @@ def main():
     print("\nTaxonomy preview:")
     print(mapping.to_string(index=False))
 
-
 if __name__ == "__main__":
     main()
